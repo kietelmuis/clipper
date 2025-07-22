@@ -9,6 +9,7 @@ fn main() {
     let muxer = capture::CaptureMuxer::new(CaptureSettings {
         resolution: config.resolution,
         fps: config.fps,
+        debug: true,
     });
 
     loop {}

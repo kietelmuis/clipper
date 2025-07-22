@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
+use windows::Win32::System::Com::CoUninitialize;
 use windows::{
     Win32::{
         Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
@@ -19,9 +20,10 @@ use windows::{
     core::IUnknown,
 };
 
+#[derive(Debug)]
 pub struct AudioBuffer {
-    buffer: Vec<u8>,
-    time: Duration,
+    pub buffer: Vec<u8>,
+    pub time: Duration,
 }
 
 pub struct AudioCaptureApi {
@@ -32,25 +34,42 @@ pub struct AudioCaptureApi {
     stop_rx: Receiver<()>,
 }
 
+struct ComThread;
+
+// initialize multithrading within thread
+impl ComThread {
+    fn new() -> Self {
+        unsafe {
+            _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        ComThread
+    }
+}
+
+// uninitiliaze when dropped within thread
+impl Drop for ComThread {
+    fn drop(&mut self) {
+        unsafe {
+            CoUninitialize();
+        }
+    }
+}
+
+// close event handle upon captureapi drop
 impl Drop for AudioCaptureApi {
     fn drop(&mut self) {
         unsafe {
-            CloseHandle(self.event_handle);
+            _ = CloseHandle(self.event_handle);
         }
     }
 }
 
 impl AudioCaptureApi {
-    pub fn new(
-        instant: Arc<Instant>,
-        callback: Sender<AudioBuffer>,
-    ) -> anyhow::Result<Sender<()>, anyhow::Error> {
+    pub fn new(instant: Arc<Instant>, callback: Sender<AudioBuffer>) -> Sender<()> {
         let (stop_tx, stop_rx) = channel::<()>();
 
         std::thread::spawn(move || {
-            unsafe {
-                CoInitializeEx(None, COINIT_MULTITHREADED);
-            }
+            let _com_guard = ComThread::new();
 
             let enumerator = unsafe {
                 CoCreateInstance::<Option<&IUnknown>, IMMDeviceEnumerator>(
@@ -116,7 +135,7 @@ impl AudioCaptureApi {
             .audio_loop();
         });
 
-        anyhow::Ok(stop_tx)
+        stop_tx
     }
 
     fn audio_loop(&mut self) {
@@ -129,7 +148,7 @@ impl AudioCaptureApi {
                 match self.stop_rx.try_recv() {
                     Ok(()) => {
                         println!("paused");
-                        continue;
+                        break;
                     }
                     _ => {}
                 }

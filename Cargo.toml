@@ -2,8 +2,10 @@
 name = "clipper"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
+rusty_ffmpeg = { version = "0.16.3", features = ["link_vcpkg_ffmpeg"] }
 anyhow = "1.0.98"
 directories = "6.0.0"
 parking_lot = "0.12.4"
@@ -15,6 +17,7 @@ windows-result = "0.3.4"
 [dependencies.windows]
 version = "0.61.3"
 features = [
+    # audio
     "Win32_Devices_FunctionDiscovery",
     "Win32_Media_Audio",
     "Win32_System_Com",
@@ -25,11 +28,12 @@ features = [
     "Win32_System_Variant",
     "Win32_UI_Shell_PropertiesSystem",
 
+    # video
     "Graphics_Capture",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Graphics_DirectX_Direct3D11",
     "Win32_System_WinRT_Direct3D11",
     "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common"
+    "Win32_Graphics_Dxgi_Common",
 ]
