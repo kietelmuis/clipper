@@ -1,10 +1,5 @@
-use std::{
-    sync::{
-        Arc,
-        mpsc::{Sender, channel},
-    },
-    time::Instant,
-};
+use crossbeam::channel;
+use std::{sync::Arc, time::Instant};
 use windows::{
     Foundation::TypedEventHandler,
     Graphics::{
@@ -44,8 +39,11 @@ pub struct VideoBuffer {
 pub struct VideoCaptureApi {}
 
 impl VideoCaptureApi {
-    pub fn new(instant: Arc<Instant>, callback: Sender<VideoBuffer>) -> Sender<()> {
-        let (stop_tx, stop_rx) = channel::<()>();
+    pub fn new(
+        instant: Arc<Instant>,
+        callback: channel::Sender<VideoBuffer>,
+    ) -> channel::Sender<()> {
+        let (stop_tx, stop_rx) = channel::unbounded::<()>();
 
         std::thread::spawn(move || {
             let mut device_option = None;

@@ -1,6 +1,7 @@
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
+
+use crossbeam::channel;
 
 use windows::Win32::System::Com::CoUninitialize;
 use windows::{
@@ -29,9 +30,9 @@ pub struct AudioBuffer {
 pub struct AudioCaptureApi {
     event_handle: HANDLE,
     audio_capture_client: IAudioCaptureClient,
-    callback: Sender<AudioBuffer>,
+    callback: channel::Sender<AudioBuffer>,
     instant: Arc<Instant>,
-    stop_rx: Receiver<()>,
+    stop_rx: channel::Receiver<()>,
 }
 
 struct ComThread;
@@ -65,8 +66,11 @@ impl Drop for AudioCaptureApi {
 }
 
 impl AudioCaptureApi {
-    pub fn new(instant: Arc<Instant>, callback: Sender<AudioBuffer>) -> Sender<()> {
-        let (stop_tx, stop_rx) = channel::<()>();
+    pub fn new(
+        instant: Arc<Instant>,
+        callback: channel::Sender<AudioBuffer>,
+    ) -> channel::Sender<()> {
+        let (stop_tx, stop_rx) = channel::unbounded::<()>();
 
         std::thread::spawn(move || {
             let _com_guard = ComThread::new();
