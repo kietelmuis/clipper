@@ -1,10 +1,11 @@
 use rusty_ffmpeg::ffi::{
-    self as ffmpeg, AV_CODEC_ID_H264, AV_PIX_FMT_BGRA, AVChannelLayout, av_channel_layout_default,
+    self as ffmpeg, AV_CODEC_ID_H264, AV_PIX_FMT_YUV420P, AVCodecContext, AVFormatContext, AVFrame,
+    AVIO_FLAG_WRITE, AVMEDIA_TYPE_VIDEO, AVRational, AVStream,
 };
 
 use crossbeam::channel;
 
-use std::{sync::Arc, time::Instant};
+use std::{ffi::CString, sync::Arc, time::Instant};
 
 pub mod audio;
 pub mod video;
@@ -22,6 +23,8 @@ pub struct CaptureMuxer {
     recv_audio: channel::Receiver<audio::AudioBuffer>,
     recv_video: channel::Receiver<video::VideoBuffer>,
 
+    debug: bool,
+
     instant: Arc<Instant>,
 }
 
@@ -29,45 +32,6 @@ impl CaptureMuxer {
     pub fn new(settings: CaptureSettings) -> Self {
         let (audio_tx, audio_rx) = channel::unbounded::<audio::AudioBuffer>();
         let (video_tx, video_rx) = channel::unbounded::<video::VideoBuffer>();
-
-        let audio_clone = audio_rx.clone();
-        let video_clone = video_rx.clone();
-
-        if settings.debug {
-            std::thread::spawn(move || {
-                let mut frames = 0;
-                let mut last_reset = std::time::Instant::now();
-
-                loop {
-                    video_clone.recv().expect("failed to receive frame");
-                    frames += 1;
-
-                    let now = std::time::Instant::now();
-                    if now.duration_since(last_reset).as_secs() >= 1 {
-                        println!("capture: {} fps", frames);
-                        frames = 0;
-                        last_reset = now;
-                    }
-                }
-            });
-
-            std::thread::spawn(move || {
-                let mut samples = 0;
-                let mut last_reset = std::time::Instant::now();
-
-                loop {
-                    audio_clone.recv().expect("failed to receive audio");
-                    samples += 1;
-
-                    let now = std::time::Instant::now();
-                    if now.duration_since(last_reset).as_secs() >= 1 {
-                        println!("capture: {} samples/sec", samples);
-                        samples = 0;
-                        last_reset = now;
-                    }
-                }
-            });
-        }
 
         let instant = Arc::new(Instant::now());
 
@@ -78,17 +42,25 @@ impl CaptureMuxer {
             recv_video: video_rx,
             recv_audio: audio_rx,
 
+            debug: settings.debug,
+
             instant: instant, // move into self
         };
 
-        muxer.mux();
+        muxer.start_muxer();
         muxer
     }
 
     // ffmpeg
     // result < 0 == error
-    fn mux(&mut self) {
-        let codec = unsafe { ffmpeg::avcodec_find_encoder(AV_CODEC_ID_H264) };
+    fn start_muxer(&mut self) {
+        // init all yo shi
+        unsafe { ffmpeg::avdevice_register_all() };
+
+        let codec_format = AV_CODEC_ID_H264;
+        let pixel_format = AV_PIX_FMT_YUV420P;
+
+        let codec = unsafe { ffmpeg::avcodec_find_encoder(codec_format) };
         if codec.is_null() {
             panic!("failed to find h264 encoder");
         }
@@ -103,7 +75,7 @@ impl CaptureMuxer {
         unsafe {
             (*encoder).width = 1920;
             (*encoder).height = 1080;
-            (*encoder).pix_fmt = ffmpeg::AV_PIX_FMT_YUV420P; // encoder expects YUV420p
+            (*encoder).pix_fmt = pixel_format;
             (*encoder).time_base = ffmpeg::AVRational { num: 1, den: 75 }; // for my 75hz monitor
         }
 
@@ -111,8 +83,64 @@ impl CaptureMuxer {
             panic!("Failed to open encoder");
         }
 
-        println!("codec is ready!");
+        println!("encoder is ready!");
 
+        let mut output = unsafe { ffmpeg::avformat_alloc_context() };
+
+        let format_name = CString::new("mp4").expect("cstring fail");
+        let file_name = CString::new("video.mp4").expect("cstring fail");
+
+        if unsafe {
+            ffmpeg::avformat_alloc_output_context2(
+                &mut output,
+                std::ptr::null(),
+                format_name.as_ptr(),
+                file_name.as_ptr(),
+            )
+        } > 0
+        {
+            panic!("output ctx fail");
+        }
+
+        // create new stream
+        let stream = unsafe { ffmpeg::avformat_new_stream(output, std::ptr::null_mut()) };
+        if stream.is_null() {
+            panic!("failed to create stream");
+        }
+        unsafe { *stream }.time_base = ffmpeg::AVRational { num: 1, den: 75 };
+
+        // edit stream's codec parameters
+        let codec_params = unsafe { &mut *(*stream).codecpar };
+        codec_params.codec_type = AVMEDIA_TYPE_VIDEO;
+        codec_params.codec_id = codec_format;
+        codec_params.width = 1920;
+        codec_params.height = 1080;
+        codec_params.format = pixel_format;
+        codec_params.bit_rate = 5_000_000;
+
+        // open aviocontext within avformatcontext for writing
+        if unsafe {
+            ffmpeg::avio_open(
+                &mut (*output).pb,
+                file_name.as_ptr(),
+                2, // cooked
+            )
+        } > 0
+        {
+            panic!("failed to open avio for writing");
+        }
+
+        println!("output context is ready!");
+
+        self.encode_frames(encoder, output, stream);
+    }
+
+    fn encode_frames(
+        &mut self,
+        encoder: *mut AVCodecContext,
+        output: *mut AVFormatContext,
+        stream: *mut AVStream,
+    ) {
         // allocate and init sws context
         let sws_context = unsafe {
             ffmpeg::sws_getContext(
@@ -132,13 +160,30 @@ impl CaptureMuxer {
             panic!("failed to allocate and init sws context");
         }
 
+        if unsafe { ffmpeg::avformat_write_header(output, std::ptr::null_mut()) } < 0 {
+            panic!("failed to write header");
+        }
+
         println!("sws context is ready!");
 
+        let mut frames = 0;
+        let start = std::time::Instant::now();
+
         loop {
-            let mut video_buffer = self
+            let video_buffer = self
                 .recv_video
                 .recv()
                 .expect("failed to receive video bufer");
+
+            frames += 1;
+            if self.debug {
+                println!("encoder: {} frames received", frames);
+            }
+
+            if std::time::Instant::now().duration_since(start).as_secs() >= 5 {
+                println!("stopping test recording");
+                break;
+            }
 
             // create empty bgra avframe
             let mut bgra_frame = unsafe { ffmpeg::av_frame_alloc() };
@@ -146,13 +191,16 @@ impl CaptureMuxer {
                 panic!("Failed to allocate AVFrame!");
             }
 
+            let mut cloned_bgra = video_buffer.bgra.clone();
+
             // fill bgra avframe data
             unsafe {
                 (*bgra_frame).format = ffmpeg::AV_PIX_FMT_BGRA;
                 (*bgra_frame).width = 1920;
                 (*bgra_frame).height = 1080;
-                (*bgra_frame).data[0] = video_buffer.bgra.as_mut_ptr();
-                (*bgra_frame).linesize[0] = 1080 * 4;
+                (*bgra_frame).pts = frames;
+                (*bgra_frame).data[0] = cloned_bgra.as_mut_ptr();
+                (*bgra_frame).linesize[0] = 1920 * 4;
             };
 
             // create empty yuv avframe
@@ -165,8 +213,9 @@ impl CaptureMuxer {
             // fill required base avframe data
             unsafe {
                 (*yuv_frame).format = ffmpeg::AV_PIX_FMT_YUV420P;
-                (*yuv_frame).height = 1920;
-                (*yuv_frame).width = 1080;
+                (*yuv_frame).width = 1920;
+                (*yuv_frame).height = 1080;
+                (*yuv_frame).pts = frames;
             };
 
             // free if failed to allocate buffer data
@@ -200,11 +249,77 @@ impl CaptureMuxer {
                 panic!("could not allocate frame buffer!");
             }
 
-            // clean up after usage
+            // clean up old bgra frame
             unsafe {
                 ffmpeg::av_frame_free(&mut bgra_frame);
-                ffmpeg::av_frame_free(&mut yuv_frame);
             }
+
+            self.write_frame(encoder, output, stream, yuv_frame);
+        }
+
+        println!("attempting to write");
+        unsafe {
+            if output.is_null() {
+                panic!("output is null");
+            }
+
+            // try to write to internal io
+            if ffmpeg::av_write_trailer(output) > 0 {
+                panic!("epic fail");
+            };
+
+            // close the internal io context inside output
+            ffmpeg::avio_close((*output).pb);
+
+            // free its streams
+            ffmpeg::avformat_free_context(output);
+        }
+        println!("success!");
+    }
+
+    fn write_frame(
+        &mut self,
+        encoder: *mut AVCodecContext,
+        output: *mut AVFormatContext,
+        stream: *mut AVStream,
+        frame: *mut AVFrame,
+    ) {
+        let mut packet = unsafe { ffmpeg::av_packet_alloc() };
+        if packet.is_null() {
+            panic!("failed to allocate packet!");
+        }
+
+        let mut ret = unsafe { ffmpeg::avcodec_send_frame(encoder, frame) };
+        if ret < 0 {
+            panic!("dang")
+        }
+
+        while ret >= 0 {
+            ret = unsafe { ffmpeg::avcodec_receive_packet(encoder, packet) };
+            if ret == ffmpeg::AVERROR(ffmpeg::EAGAIN) || ret == ffmpeg::AVERROR_EOF {
+                break;
+            } else if ret < 0 {
+                panic!("fuck");
+            }
+
+            unsafe {
+                ffmpeg::av_packet_rescale_ts(packet, (*encoder).time_base, (*stream).time_base);
+                (*packet).stream_index = (*stream).index;
+            };
+
+            unsafe {
+                println!("packet size: {}", (*packet).size);
+            }
+
+            if unsafe { ffmpeg::av_interleaved_write_frame(output, packet) } < 0 {
+                panic!("write fail");
+            }
+
+            unsafe { ffmpeg::av_packet_unref(packet) };
+        }
+
+        unsafe {
+            ffmpeg::av_packet_free(&mut packet);
         }
     }
 }
