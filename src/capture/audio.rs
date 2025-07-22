@@ -156,16 +156,14 @@ impl AudioCaptureApi {
                 let mut data_ptr: *mut u8 = std::ptr::null_mut();
                 let mut num_frames: u32 = 0;
                 let mut flags: u32 = 0;
-                let mut device_pos: u64 = 0;
-                let mut qpc_pos: u64 = 0;
 
                 unsafe {
                     self.audio_capture_client.GetBuffer(
                         &mut data_ptr,
                         &mut num_frames,
                         &mut flags,
-                        Some(&mut device_pos),
-                        Some(&mut qpc_pos),
+                        None,
+                        None,
                     )
                 }
                 .expect("failed to get buffer!");
