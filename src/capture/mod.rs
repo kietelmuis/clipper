@@ -1,6 +1,6 @@
 use rusty_ffmpeg::ffi::{
-    self as ffmpeg, AV_CODEC_ID_H264, AV_PIX_FMT_YUV420P, AVCodecContext, AVFormatContext, AVFrame,
-    AVMEDIA_TYPE_VIDEO, AVStream,
+    self as ffmpeg, AV_CODEC_ID_AAC, AV_CODEC_ID_HEVC, AV_PIX_FMT_YUV420P, AVCodecContext,
+    AVFormatContext, AVFrame, AVMEDIA_TYPE_VIDEO, AVStream,
 };
 
 use crossbeam::channel;
@@ -33,7 +33,7 @@ impl CaptureMuxer {
 
         let instant = Arc::new(Instant::now());
 
-        let mut muxer = Self {
+        Self {
             stop_video: video::VideoCaptureApi::new(instant.clone(), video_tx),
             stop_audio: audio::AudioCaptureApi::new(instant.clone(), audio_tx),
 
@@ -41,69 +41,68 @@ impl CaptureMuxer {
             recv_audio: audio_rx,
 
             instant: instant, // move into self
-        };
-
-        muxer.start_muxer();
-        muxer
+        }
     }
 
     // ffmpeg
     // result < 0 == error
-    fn start_muxer(&mut self) {
+    pub fn start_muxer(&mut self) {
         // init all yo shi
         unsafe { ffmpeg::avdevice_register_all() };
 
-        let codec_format = AV_CODEC_ID_H264;
+        // choose them formats bruh
+        let audio_format = AV_CODEC_ID_AAC;
+        let codec_format = AV_CODEC_ID_HEVC;
         let pixel_format = AV_PIX_FMT_YUV420P;
 
-        let codec = unsafe { ffmpeg::avcodec_find_encoder(codec_format) };
-        if codec.is_null() {
-            panic!("failed to find h264 encoder");
+        let video_codec = unsafe { ffmpeg::avcodec_find_encoder(codec_format) };
+        if video_codec.is_null() {
+            panic!("failed to find video encoder");
         }
 
-        let mut codec_options: *mut ffmpeg::AVDictionary = std::ptr::null_mut();
-        unsafe {
-            ffmpeg::av_dict_set(
-                &mut codec_options,
-                b"preset\0".as_ptr() as *const _,
-                b"veryfast\0".as_ptr() as *const _,
-                0,
-            );
-            ffmpeg::av_dict_set(
-                &mut codec_options,
-                b"crf\0".as_ptr() as *const _,
-                b"23\0".as_ptr() as *const _,
-                0,
-            );
-            ffmpeg::av_dict_set(
-                &mut codec_options,
-                b"bitrate\0".as_ptr() as *const _,
-                b"5000000\0".as_ptr() as *const _,
-                0,
-            );
-        };
+        let audio_codec = unsafe { ffmpeg::avcodec_find_encoder(audio_format) };
+        if audio_codec.is_null() {
+            panic!("failed to find audio encoder");
+        }
 
-        // allocate encoder
-        let encoder = unsafe { ffmpeg::avcodec_alloc_context3(codec) };
-        if encoder.is_null() {
+        // allocate audio encoder
+        let audio_encoder = unsafe { ffmpeg::avcodec_alloc_context3(audio_codec) };
+        if audio_encoder.is_null() {
             panic!("failed to allocate codec context");
         }
 
-        // configure encoder
+        // configure audio encoder
         unsafe {
-            (*encoder).width = 1920;
-            (*encoder).height = 1080;
-            (*encoder).pix_fmt = pixel_format;
-            (*encoder).time_base = ffmpeg::AVRational { num: 1, den: 75 }; // for my 75hz
-
-            (*encoder).bit_rate = 5_000_000;
-            (*encoder).rc_max_rate = 5_000_000;
-            (*encoder).rc_min_rate = 5_000_000;
-            (*encoder).rc_buffer_size = 10_000_000;
+            (*audio_encoder).width = 1920;
+            (*audio_encoder).height = 1080;
+            (*audio_encoder).pix_fmt = pixel_format;
+            (*audio_encoder).time_base = ffmpeg::AVRational { num: 1, den: 75 }; // for my 75hz
+            (*audio_encoder).bit_rate = 9_000_000;
         }
 
-        if unsafe { ffmpeg::avcodec_open2(encoder, codec, &mut codec_options) } < 0 {
-            panic!("Failed to open encoder");
+        // open audio encoder
+        if unsafe { ffmpeg::avcodec_open2(audio_encoder, video_codec, std::ptr::null_mut()) } < 0 {
+            panic!("Failed to open video encoder");
+        }
+
+        // allocate video encoder
+        let video_encoder = unsafe { ffmpeg::avcodec_alloc_context3(video_codec) };
+        if video_encoder.is_null() {
+            panic!("failed to allocate codec context");
+        }
+
+        // configure video encoder
+        unsafe {
+            (*video_encoder).width = 1920;
+            (*video_encoder).height = 1080;
+            (*video_encoder).pix_fmt = pixel_format;
+            (*video_encoder).time_base = ffmpeg::AVRational { num: 1, den: 75 }; // for my 75hz
+            (*video_encoder).bit_rate = 9_000_000;
+        }
+
+        // open video encoder
+        if unsafe { ffmpeg::avcodec_open2(video_encoder, video_codec, std::ptr::null_mut()) } < 0 {
+            panic!("Failed to open video encoder");
         }
 
         let mut output = unsafe { ffmpeg::avformat_alloc_context() };
@@ -151,7 +150,7 @@ impl CaptureMuxer {
             panic!("failed to open avio for writing");
         }
 
-        self.encode_frames(encoder, output, stream);
+        self.encode_frames(video_encoder, output, stream);
     }
 
     fn encode_frames(
