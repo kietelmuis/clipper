@@ -1,9 +1,12 @@
-use crossbeam::channel;
+use crossbeam::channel::{self, Receiver, SendError, Sender};
 use std::{sync::Arc, time::Instant};
 use windows::{
     Foundation::TypedEventHandler,
     Graphics::{
-        Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem},
+        Capture::{
+            Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem,
+            GraphicsCaptureSession,
+        },
         DirectX::{
             Direct3D11::{IDirect3DDevice, IDirect3DSurface},
             DirectXPixelFormat,
@@ -17,7 +20,8 @@ use windows::{
             Direct3D11::{
                 D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
                 D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-                D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Texture2D,
+                D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
+                ID3D11Texture2D,
             },
             Dxgi::IDXGIDevice,
         },
@@ -25,7 +29,7 @@ use windows::{
             CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
         },
     },
-    core::{Interface, Ref},
+    core::{IInspectable, Interface, Ref},
 };
 
 #[derive(Debug)]
@@ -36,163 +40,211 @@ pub struct VideoBuffer {
     pub timestamp: u64,
 }
 
-pub struct VideoCaptureApi {}
+impl Drop for VideoCaptureApi {
+    fn drop(&mut self) {
+        println!("cleaning video api");
+        _ = self.stop();
+    }
+}
+
+pub struct VideoCaptureApi {
+    pub video_rx: Receiver<VideoBuffer>,
+
+    instant: Arc<Instant>,
+    callback: Arc<Sender<VideoBuffer>>,
+
+    frame_pool: Option<Arc<Direct3D11CaptureFramePool>>,
+    frame_handler: Option<TypedEventHandler<Direct3D11CaptureFramePool, IInspectable>>,
+    capture_session: Option<GraphicsCaptureSession>,
+}
 
 impl VideoCaptureApi {
-    pub fn new(
-        instant: Arc<Instant>,
-        callback: channel::Sender<VideoBuffer>,
-    ) -> channel::Sender<()> {
-        let (stop_tx, stop_rx) = channel::unbounded::<()>();
+    pub fn new(instant: Arc<Instant>) -> Self {
+        let (video_tx, video_rx) = channel::unbounded::<VideoBuffer>();
 
-        std::thread::spawn(move || {
-            let mut device_option = None;
-            unsafe {
-                D3D11CreateDevice(
-                    None,
-                    D3D_DRIVER_TYPE_HARDWARE,
-                    HMODULE::default(),
-                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                    None,
-                    D3D11_SDK_VERSION,
-                    Some(&mut device_option),
-                    None,
-                    None,
-                )
-            }
-            .expect("failed to create device");
+        let mut capture_api = Self {
+            video_rx,
 
-            let device = Arc::new(device_option.expect("failed to unwrap device"));
-            let device_context = Arc::new(
-                unsafe { device.GetImmediateContext() }.expect("failed to get device context"),
-            );
+            instant,
+            callback: Arc::new(video_tx),
 
-            let dxgi_device: IDXGIDevice = device.cast().expect("failed to cast dxgi device");
+            frame_pool: None,
+            frame_handler: None,
+            capture_session: None,
+        };
 
-            let directx_device: IDirect3DDevice =
-                unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) }
-                    .expect("failed to get direct3d device")
-                    .cast()
-                    .expect("failed to cast d3d device");
+        capture_api.init();
+        capture_api
+    }
 
-            // create capture item from primary display
-            let capture_item =
-                GraphicsCaptureItem::TryCreateFromDisplayId(DisplayId { Value: 0 }).expect("ok");
+    pub fn start(&mut self) -> windows::core::Result<()> {
+        if let Some(session) = &self.capture_session {
+            session.StartCapture()?;
+        }
+        Ok(())
+    }
 
-            // create frame pool with d3d devie and monitor size
-            let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+    pub fn stop(&mut self) -> windows::core::Result<()> {
+        if let Some(session) = &self.capture_session {
+            session.Close()?;
+        }
+        Ok(())
+    }
+
+    fn init(&mut self) {
+        let mut device_option = None;
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device_option),
+                None,
+                None,
+            )
+        }
+        .expect("failed to create device");
+
+        let device = Arc::new(device_option.expect("failed to unwrap device"));
+        let device_context = Arc::new(
+            unsafe { device.GetImmediateContext() }.expect("failed to get device context"),
+        );
+
+        let dxgi_device: IDXGIDevice = device.cast().expect("failed to cast dxgi device");
+
+        let directx_device: IDirect3DDevice =
+            unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) }
+                .expect("failed to get direct3d device")
+                .cast()
+                .expect("failed to cast d3d device");
+
+        // create capture item from primary display
+        let capture_item =
+            GraphicsCaptureItem::TryCreateFromDisplayId(DisplayId { Value: 0 }).expect("ok");
+
+        // create frame pool with d3d devie and monitor size
+        let frame_pool = Arc::new(
+            Direct3D11CaptureFramePool::CreateFreeThreaded(
                 &directx_device,
                 DirectXPixelFormat::B8G8R8A8UIntNormalized,
                 3,
                 capture_item.Size().expect("failed to get monitor size"),
             )
-            .expect("failed to create frame pool");
+            .expect("failed to create frame pool"),
+        );
 
-            let cb = Arc::new(callback);
+        // save framepool in struct to avoid out of scope
+        self.frame_pool = Some(frame_pool.clone());
 
-            // bind to frame
-            let handler = TypedEventHandler::new(
-                move |frame_pool: Ref<Direct3D11CaptureFramePool>, _: Ref<_>| {
-                    if let Some(pool) = frame_pool.as_ref() {
-                        if let Ok(frame) = pool.TryGetNextFrame() {
-                            let content_size =
-                                frame.ContentSize().expect("failed to get frame size");
+        let instant_clone = self.instant.clone();
+        let callback_clone = self.callback.clone();
 
-                            let d3d_surface: IDirect3DSurface =
-                                frame.Surface().expect("failed to get frame surface");
-
-                            let dxgi_interface_access: IDirect3DDxgiInterfaceAccess = d3d_surface
-                                .cast()
-                                .expect("failed to cast to interface access");
-
-                            let frame_texture: ID3D11Texture2D =
-                                unsafe { dxgi_interface_access.GetInterface::<ID3D11Texture2D>() }
-                                    .expect("could not get texture interface")
-                                    .cast()
-                                    .expect("could not cast texture interface");
-
-                            let mut desc = D3D11_TEXTURE2D_DESC::default();
-                            unsafe {
-                                frame_texture.GetDesc(&mut desc);
-                            }
-
-                            desc.Usage = D3D11_USAGE_STAGING;
-                            desc.BindFlags = 0;
-                            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
-                            desc.MiscFlags = 0;
-
-                            let mut staging_texture: Option<ID3D11Texture2D> = None;
-
-                            unsafe {
-                                device.CreateTexture2D(&desc, None, Some(&mut staging_texture))
-                            }
-                            .expect("couldn't create staging texture");
-
-                            let texture: ID3D11Texture2D =
-                                staging_texture.clone().expect("failed to unwrap texture");
-
-                            unsafe { device_context.CopyResource(&texture, &frame_texture) };
-
-                            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                            unsafe {
-                                device_context.Map(
-                                    &texture,
-                                    0,
-                                    D3D11_MAP_READ,
-                                    0,
-                                    Some(&mut mapped),
-                                )?;
-                            }
-
-                            let buffer_size =
-                                (mapped.RowPitch * content_size.Height as u32) as usize;
-                            let buffer = VideoBuffer {
-                                bgra: unsafe {
-                                    std::slice::from_raw_parts(
-                                        mapped.pData as *const u8,
-                                        buffer_size,
-                                    )
-                                }
-                                .to_vec(),
-                                height: content_size.Height as u32,
-                                width: content_size.Width as u32,
-                                timestamp: instant.elapsed().as_nanos() as u64,
-                            };
-
-                            unsafe {
-                                device_context.Unmap(
-                                    &staging_texture.expect("failed to unwrap staging texture"),
-                                    0,
-                                )
-                            };
-
-                            cb.send(buffer).expect("failed to send videobuffer");
-                        }
+        // bind to frame
+        println!("event bound");
+        let handler = TypedEventHandler::new(
+            move |fpool: Ref<Direct3D11CaptureFramePool>, _: Ref<IInspectable>| {
+                if let Some(pool) = fpool.as_ref() {
+                    if let Ok(frame) = pool.TryGetNextFrame() {
+                        VideoCaptureApi::handle_frame(
+                            frame,
+                            device.clone(),
+                            device_context.clone(),
+                            instant_clone.clone(),
+                            callback_clone.clone(),
+                        );
                     }
-                    Ok(())
-                },
-            );
-            frame_pool
-                .FrameArrived(&handler)
-                .expect("failed to bind to frame");
-
-            // create and start capture session
-            let capture_session = frame_pool
-                .CreateCaptureSession(&capture_item)
-                .expect("failed to create capture session");
-
-            capture_session
-                .StartCapture()
-                .expect("failed to start capturing");
-
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                if stop_rx.try_recv().is_ok() {
-                    break;
                 }
-            }
-        });
+                Ok(())
+            },
+        );
+        self.frame_handler = Some(handler);
 
-        stop_tx
+        frame_pool
+            .FrameArrived(self.frame_handler.as_ref().expect("handler not set"))
+            .expect("failed to set frame arrived");
+
+        // create and start capture session
+        let capture_session = frame_pool
+            .CreateCaptureSession(&capture_item)
+            .expect("failed to create capture session");
+
+        capture_session
+            .StartCapture()
+            .expect("failed to start capturing");
+
+        // store capture session to keep it alive
+        self.capture_session = Some(capture_session);
+        println!("Capture session started and stored");
+    }
+
+    fn handle_frame(
+        frame: Direct3D11CaptureFrame,
+        device: Arc<ID3D11Device>,
+        device_context: Arc<ID3D11DeviceContext>,
+        instant: Arc<Instant>,
+        callback: Arc<Sender<VideoBuffer>>,
+    ) {
+        let d3d_surface: IDirect3DSurface = frame.Surface().expect("failed to get frame surface");
+
+        let dxgi_interface_access: IDirect3DDxgiInterfaceAccess = d3d_surface
+            .cast()
+            .expect("failed to cast to interface access");
+
+        let frame_texture: ID3D11Texture2D =
+            unsafe { dxgi_interface_access.GetInterface::<ID3D11Texture2D>() }
+                .expect("could not get texture interface")
+                .cast()
+                .expect("could not cast texture interface");
+
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe {
+            frame_texture.GetDesc(&mut desc);
+        }
+
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        desc.MiscFlags = 0;
+
+        let mut staging_texture: Option<ID3D11Texture2D> = None;
+
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut staging_texture)) }
+            .expect("couldn't create staging texture");
+
+        let texture: ID3D11Texture2D = staging_texture.clone().expect("failed to unwrap texture");
+
+        unsafe { device_context.CopyResource(&texture, &frame_texture) };
+
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            device_context
+                .Map(&texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .expect("failed to map texture");
+        }
+
+        let content_size = frame.ContentSize().expect("failed to get frame size");
+
+        let buffer_size = (mapped.RowPitch * content_size.Height as u32) as usize;
+        let buffer = VideoBuffer {
+            bgra: unsafe { std::slice::from_raw_parts(mapped.pData as *const u8, buffer_size) }
+                .to_vec(),
+            height: content_size.Height as u32,
+            width: content_size.Width as u32,
+            timestamp: instant.elapsed().as_nanos() as u64,
+        };
+
+        unsafe {
+            device_context.Unmap(
+                &staging_texture.expect("failed to unwrap staging texture"),
+                0,
+            )
+        };
+
+        if let Err(e) = callback.send(buffer) {
+            println!("Failed to send video buffer: {:?}", e)
+        }
     }
 }

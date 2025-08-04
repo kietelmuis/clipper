@@ -1,11 +1,16 @@
 use rusty_ffmpeg::ffi::{
-    self as ffmpeg, AV_CODEC_ID_AAC, AV_CODEC_ID_HEVC, AV_PIX_FMT_YUV420P, AVCodecContext,
-    AVFormatContext, AVFrame, AVMEDIA_TYPE_VIDEO, AVStream,
+    self as ffmpeg, AV_CHANNEL_ORDER_UNSPEC, AV_CODEC_ID_AAC, AV_CODEC_ID_H264, AV_CODEC_ID_HEVC,
+    AV_PIX_FMT_YUV420P, AV_SAMPLE_FMT_FLTP, AVChannelLayout, AVChannelLayout__bindgen_ty_1,
+    AVCodecContext, AVFormatContext, AVFrame, AVMEDIA_TYPE_VIDEO, AVStream,
+    av_channel_layout_default,
 };
 
-use crossbeam::channel;
+use crossbeam::channel::{self, SendError};
+use windows::Win32::UI::Shell::PAI_EXPIRETIME;
 
-use std::{ffi::CString, sync::Arc, time::Instant};
+use std::{ffi::CString, sync::Arc, thread::JoinHandle, time::Instant};
+
+use crate::capture::{audio::AudioCaptureApi, video::VideoCaptureApi};
 
 pub mod audio;
 pub mod video;
@@ -16,31 +21,33 @@ pub struct CaptureSettings {
 }
 
 pub struct CaptureMuxer {
-    // stop channels
-    stop_video: channel::Sender<()>,
-    stop_audio: channel::Sender<()>,
-
-    recv_audio: channel::Receiver<audio::AudioBuffer>,
-    recv_video: channel::Receiver<video::VideoBuffer>,
+    // communication channels
+    video_api: VideoCaptureApi,
+    audio_api: AudioCaptureApi,
 
     instant: Arc<Instant>,
 }
 
 impl CaptureMuxer {
     pub fn new(settings: CaptureSettings) -> Self {
-        let (audio_tx, audio_rx) = channel::unbounded::<audio::AudioBuffer>();
-        let (video_tx, video_rx) = channel::unbounded::<video::VideoBuffer>();
-
         let instant = Arc::new(Instant::now());
 
+        let video_api = VideoCaptureApi::new(instant.clone());
+        let audio_api = AudioCaptureApi::new(instant.clone());
+
         Self {
-            stop_video: video::VideoCaptureApi::new(instant.clone(), video_tx),
-            stop_audio: audio::AudioCaptureApi::new(instant.clone(), audio_tx),
+            video_api,
+            audio_api,
+            instant,
+        }
+    }
 
-            recv_video: video_rx,
-            recv_audio: audio_rx,
-
-            instant: instant, // move into self
+    pub fn stop_recording(&mut self) {
+        if let Err(e) = self.video_api.stop() {
+            eprintln!("Failed to stop video capture: {:?}", e);
+        }
+        if let Err(e) = self.audio_api.stop() {
+            eprintln!("Failed to stop audio capture: {:?}", e);
         }
     }
 
@@ -52,8 +59,12 @@ impl CaptureMuxer {
 
         // choose them formats bruh
         let audio_format = AV_CODEC_ID_AAC;
-        let codec_format = AV_CODEC_ID_HEVC;
+        let sample_rate = 48000;
+
+        let codec_format = AV_CODEC_ID_H264;
         let pixel_format = AV_PIX_FMT_YUV420P;
+
+        let timebase = ffmpeg::AVRational { num: 1, den: 75 };
 
         let video_codec = unsafe { ffmpeg::avcodec_find_encoder(codec_format) };
         if video_codec.is_null() {
@@ -71,18 +82,26 @@ impl CaptureMuxer {
             panic!("failed to allocate codec context");
         }
 
+        // make default avchannellayout
+        let mut channel_layout = AVChannelLayout {
+            order: AV_CHANNEL_ORDER_UNSPEC,
+            nb_channels: 0,
+            opaque: std::ptr::null_mut(),
+            u: AVChannelLayout__bindgen_ty_1 { mask: 0 },
+        };
+
         // configure audio encoder
         unsafe {
-            (*audio_encoder).width = 1920;
-            (*audio_encoder).height = 1080;
-            (*audio_encoder).pix_fmt = pixel_format;
-            (*audio_encoder).time_base = ffmpeg::AVRational { num: 1, den: 75 }; // for my 75hz
-            (*audio_encoder).bit_rate = 9_000_000;
+            av_channel_layout_default(&mut channel_layout, 2);
+            (*audio_encoder).ch_layout = channel_layout;
+            (*audio_encoder).time_base = timebase;
+            (*audio_encoder).sample_fmt = AV_SAMPLE_FMT_FLTP;
+            (*audio_encoder).sample_rate = sample_rate;
         }
 
         // open audio encoder
-        if unsafe { ffmpeg::avcodec_open2(audio_encoder, video_codec, std::ptr::null_mut()) } < 0 {
-            panic!("Failed to open video encoder");
+        if unsafe { ffmpeg::avcodec_open2(audio_encoder, audio_codec, std::ptr::null_mut()) } < 0 {
+            panic!("Failed to open audio encoder");
         }
 
         // allocate video encoder
@@ -96,7 +115,7 @@ impl CaptureMuxer {
             (*video_encoder).width = 1920;
             (*video_encoder).height = 1080;
             (*video_encoder).pix_fmt = pixel_format;
-            (*video_encoder).time_base = ffmpeg::AVRational { num: 1, den: 75 }; // for my 75hz
+            (*video_encoder).time_base = timebase; // for my 75hz
             (*video_encoder).bit_rate = 9_000_000;
         }
 
@@ -150,12 +169,13 @@ impl CaptureMuxer {
             panic!("failed to open avio for writing");
         }
 
-        self.encode_frames(video_encoder, output, stream);
+        self.encode_frames(video_encoder, audio_encoder, output, stream);
     }
 
     fn encode_frames(
         &mut self,
-        mut encoder: *mut AVCodecContext,
+        mut video_encoder: *mut AVCodecContext,
+        mut audio_encoder: *mut AVCodecContext,
         output: *mut AVFormatContext,
         stream: *mut AVStream,
     ) {
@@ -186,27 +206,32 @@ impl CaptureMuxer {
         let mut frames = 0;
         let mut last_second = 0;
 
-        let start = std::time::Instant::now();
+        // different from internal instant
+        let record_instant = std::time::Instant::now();
 
         // attempt to get video frames
         loop {
             let video_buffer = self
-                .recv_video
+                .video_api
+                .video_rx
                 .recv()
                 .expect("failed to receive video bufer");
 
             frames += 1;
 
-            let seconds_elapsed = std::time::Instant::now().duration_since(start).as_secs();
+            let seconds_elapsed = std::time::Instant::now()
+                .duration_since(record_instant)
+                .as_secs();
+
+            // test: stop after 15th frame
+            if seconds_elapsed >= 16 {
+                println!("stopping test recording");
+                break;
+            }
+
             if seconds_elapsed != last_second {
                 println!("encoder: recording for {}s", seconds_elapsed);
                 last_second = seconds_elapsed;
-            }
-
-            // test: 15 second recording
-            if seconds_elapsed >= 15 {
-                println!("stopping test recording");
-                break;
             }
 
             // create empty yuv avframe
@@ -250,14 +275,14 @@ impl CaptureMuxer {
                 panic!("could not allocate frame buffer!");
             }
 
-            self.write_frame(encoder, output, stream, yuv_frame);
+            self.write_frame(video_encoder, output, stream, yuv_frame);
 
             unsafe {
                 ffmpeg::av_frame_free(&mut yuv_frame);
             }
         }
 
-        self.stop_video.send(()).expect("failed to stop video");
+        self.stop_recording();
 
         println!("encoder: attempting to write");
         unsafe {
@@ -273,8 +298,9 @@ impl CaptureMuxer {
             // close the internal io context inside output
             ffmpeg::avio_close((*output).pb);
 
-            // free the encoder
-            ffmpeg::avcodec_free_context(&mut encoder);
+            // free the encoders
+            ffmpeg::avcodec_free_context(&mut video_encoder);
+            ffmpeg::avcodec_free_context(&mut audio_encoder);
 
             // free its streams
             ffmpeg::avformat_free_context(output);

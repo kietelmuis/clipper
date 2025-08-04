@@ -1,8 +1,9 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crossbeam::channel;
+use crossbeam::channel::{self, Receiver, SendError};
 
+use windows::Win32::Media::Audio::PKEY_AudioEngine_DeviceFormat;
 use windows::Win32::System::Com::CoUninitialize;
 use windows::{
     Win32::{
@@ -14,7 +15,7 @@ use windows::{
             IMMDeviceEnumerator, MMDeviceEnumerator,
         },
         System::{
-            Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, STGM_READ},
+            Com::{CLSCTX_ALL, CoCreateInstance, STGM_READ},
             Threading::{CreateEventW, INFINITE, ResetEvent, WaitForSingleObject},
         },
     },
@@ -27,134 +28,172 @@ pub struct AudioBuffer {
     pub time: Duration,
 }
 
-pub struct AudioCaptureApi {
-    event_handle: HANDLE,
-    audio_capture_client: IAudioCaptureClient,
-    callback: channel::Sender<AudioBuffer>,
+struct InternalCaptureApi {
+    event_handle: Option<HANDLE>,
+    capture_client: Option<IAudioCaptureClient>,
+    stop_rx: channel::Receiver<bool>,
     instant: Arc<Instant>,
-    stop_rx: channel::Receiver<()>,
+    callback: channel::Sender<AudioBuffer>,
 }
 
-struct ComThread;
+// im dead
+unsafe impl Send for InternalCaptureApi {}
+unsafe impl Sync for InternalCaptureApi {}
 
-// initialize multithrading within thread
-impl ComThread {
-    fn new() -> Self {
-        unsafe {
-            _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        }
-        ComThread
-    }
-}
-
-// uninitiliaze when dropped within thread
-impl Drop for ComThread {
-    fn drop(&mut self) {
-        unsafe {
-            CoUninitialize();
-        }
-    }
+pub struct AudioCaptureApi {
+    pub audio_rx: Receiver<AudioBuffer>,
+    internal: Arc<Mutex<InternalCaptureApi>>,
+    stop_tx: channel::Sender<bool>,
 }
 
 // close event handle upon captureapi drop
-impl Drop for AudioCaptureApi {
+impl Drop for InternalCaptureApi {
     fn drop(&mut self) {
+        println!("cleaning audio api");
         unsafe {
-            _ = CloseHandle(self.event_handle);
+            CoUninitialize();
+
+            if let Some(handle) = self.event_handle {
+                _ = CloseHandle(handle);
+            }
         }
     }
 }
 
 impl AudioCaptureApi {
-    pub fn new(
-        instant: Arc<Instant>,
-        callback: channel::Sender<AudioBuffer>,
-    ) -> channel::Sender<()> {
-        let (stop_tx, stop_rx) = channel::unbounded::<()>();
+    pub fn new(instant: Arc<Instant>) -> Self {
+        let (audio_tx, audio_rx) = channel::unbounded::<AudioBuffer>();
+        let (stop_tx, stop_rx) = channel::unbounded::<bool>();
 
+        let mut internal_api = Arc::new(Mutex::new(InternalCaptureApi {
+            event_handle: None,
+            capture_client: None,
+            stop_rx: stop_rx,
+            instant: instant,
+            callback: audio_tx,
+        }));
+
+        let mut capture_api = AudioCaptureApi {
+            audio_rx,
+            internal: internal_api.clone(),
+            stop_tx,
+        };
+
+        internal_api.lock().unwrap().init();
+
+        let inner = internal_api.clone();
         std::thread::spawn(move || {
-            let _com_guard = ComThread::new();
-
-            let enumerator = unsafe {
-                CoCreateInstance::<Option<&IUnknown>, IMMDeviceEnumerator>(
-                    &MMDeviceEnumerator,
-                    None,
-                    CLSCTX_ALL,
-                )
-            }
-            .expect("couldn't create enumerator");
-
-            let device = unsafe {
-                enumerator.GetDefaultAudioEndpoint(EDataFlow::default(), ERole::default())
-            }
-            .expect("couldn't get audio device");
-
-            let device_friendly_name = unsafe {
-                device
-                    .OpenPropertyStore(STGM_READ)
-                    .expect("couldn't get device properties")
-                    .GetValue(&PKEY_Device_FriendlyName)
-                    .expect("couldn't get device name")
-                    .to_string()
-            };
-            println!("using device: {}", device_friendly_name);
-
-            let audio_client = unsafe { device.Activate::<IAudioClient>(CLSCTX_ALL, None) }
-                .expect("couldn't activate audio device");
-            unsafe {
-                audio_client.Initialize(
-                    AUDCLNT_SHAREMODE_SHARED,
-                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_LOOPBACK, // wait for event and
-                    1000000,                                                          // 100ns
-                    0,
-                    audio_client
-                        .GetMixFormat()
-                        .expect("couldn't get audio mix format"),
-                    None,
-                )
-            }
-            .expect("couldn't initialize audio client");
-
-            let event = unsafe { CreateEventW(None, true, false, None) }
-                .expect("couldn't create event handle");
-            unsafe { audio_client.SetEventHandle(event) }.expect("couldn't set audio event handle");
-
-            let buffer_size =
-                unsafe { audio_client.GetBufferSize() }.expect("couldn't get buffer size");
-            println!("buffer size: {} Hz", buffer_size);
-
-            let audio_capture_client = unsafe { audio_client.GetService::<IAudioCaptureClient>() }
-                .expect("couldn't get audio capture client");
-
-            unsafe { audio_client.Start() }.expect("failed to start audio client");
-
-            AudioCaptureApi {
-                event_handle: event,
-                audio_capture_client: audio_capture_client,
-                callback: callback,
-                instant: instant,
-
-                stop_rx: stop_rx,
-            }
-            .audio_loop();
+            let mut guard = inner.lock().unwrap();
+            guard.event_loop();
         });
 
-        stop_tx
+        capture_api
     }
 
-    fn audio_loop(&mut self) {
+    pub fn start(&mut self) -> Result<(), SendError<bool>> {
+        self.stop_tx.send(true)?;
+        Ok(())
+    }
+
+    pub fn stop(&mut self) -> Result<(), SendError<bool>> {
+        self.stop_tx.send(false)?;
+        Ok(())
+    }
+}
+
+impl InternalCaptureApi {
+    fn init(&mut self) {
+        // create audio device enumerator
+        let enumerator = unsafe {
+            CoCreateInstance::<Option<&IUnknown>, IMMDeviceEnumerator>(
+                &MMDeviceEnumerator,
+                None,
+                CLSCTX_ALL,
+            )
+        }
+        .expect("couldn't create enumerator");
+
+        // create audio device from default endpoint
+        let device =
+            unsafe { enumerator.GetDefaultAudioEndpoint(EDataFlow::default(), ERole::default()) }
+                .expect("couldn't get audio device");
+
+        // get device data
+        let property_store = unsafe {
+            device
+                .OpenPropertyStore(STGM_READ)
+                .expect("failed to open properties")
+        };
+
+        let name = unsafe { property_store.GetValue(&PKEY_Device_FriendlyName) }
+            .expect("failed to get audio device name");
+        println!("[audio] using device: {}", name);
+
+        let _audio_engine = unsafe { property_store.GetValue(&PKEY_AudioEngine_DeviceFormat) }
+            .expect("failed toget audio engine");
+
+        // create and activate audio client on device
+        let audio_client = unsafe { device.Activate::<IAudioClient>(CLSCTX_ALL, None) }
+            .expect("couldn't activate audio device");
+        unsafe {
+            audio_client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_LOOPBACK, // wait for event and
+                1000000,                                                          // 100ns
+                0,
+                audio_client
+                    .GetMixFormat()
+                    .expect("couldn't get audio mix format"),
+                None,
+            )
+        }
+        .expect("couldn't initialize audio client");
+
+        // create event handle for audio events
+        let event =
+            unsafe { CreateEventW(None, true, false, None) }.expect("couldn't create event handle");
+        unsafe { audio_client.SetEventHandle(event) }.expect("couldn't set audio event handle");
+
+        self.event_handle = Some(event);
+
+        // get device buffer size
+        let buffer_size =
+            unsafe { audio_client.GetBufferSize() }.expect("couldn't get buffer size");
+        println!("[audio] buffersize: {}Hz", buffer_size);
+
+        let audio_capture_client = unsafe { audio_client.GetService::<IAudioCaptureClient>() }
+            .expect("couldn't get audio capture client");
+
+        unsafe { audio_client.Start() }.expect("failed to start audio client");
+
+        self.capture_client = Some(audio_capture_client);
+    }
+
+    fn event_loop(&mut self) {
+        let capture_client = self
+            .capture_client
+            .as_mut()
+            .expect("audio capture client not ready!");
+
+        let handle = self.event_handle.expect("event handle missing");
+
         loop {
             unsafe {
-                WaitForSingleObject(self.event_handle, INFINITE);
+                WaitForSingleObject(handle, INFINITE);
             }
 
+            // break inner loop to wait for next audio
+            // outerloop should never break
             loop {
-                match self.stop_rx.try_recv() {
-                    Ok(()) => {
-                        println!("paused");
-                        break;
+                if let Ok(true) = self.stop_rx.try_recv() {
+                    println!("paused");
+                    loop {
+                        if let Ok(false) = self.stop_rx.try_recv() {
+                            println!("resumed");
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
                     }
-                    _ => {}
                 }
 
                 let mut data_ptr: *mut u8 = std::ptr::null_mut();
@@ -162,13 +201,7 @@ impl AudioCaptureApi {
                 let mut flags: u32 = 0;
 
                 unsafe {
-                    self.audio_capture_client.GetBuffer(
-                        &mut data_ptr,
-                        &mut num_frames,
-                        &mut flags,
-                        None,
-                        None,
-                    )
+                    capture_client.GetBuffer(&mut data_ptr, &mut num_frames, &mut flags, None, None)
                 }
                 .expect("failed to get buffer!");
 
@@ -198,12 +231,12 @@ impl AudioCaptureApi {
                     eprintln!("failed to send audio callback: {}", e);
                 }
 
-                unsafe { self.audio_capture_client.ReleaseBuffer(num_frames) }
+                unsafe { capture_client.ReleaseBuffer(num_frames) }
                     .expect("failed to release buffer");
             }
 
             unsafe {
-                ResetEvent(self.event_handle).expect("failed to reset event");
+                ResetEvent(handle).expect("failed to reset event");
             }
         }
     }
