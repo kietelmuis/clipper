@@ -143,7 +143,7 @@ impl VideoCaptureApi {
         let callback_clone = self.callback.clone();
 
         // bind to frame
-        println!("event bound");
+        println!("[video] event bound");
         let handler = TypedEventHandler::new(
             move |fpool: Ref<Direct3D11CaptureFramePool>, _: Ref<IInspectable>| {
                 if let Some(pool) = fpool.as_ref() {
@@ -177,7 +177,6 @@ impl VideoCaptureApi {
 
         // store capture session to keep it alive
         self.capture_session = Some(capture_session);
-        println!("Capture session started and stored");
     }
 
     fn handle_frame(
