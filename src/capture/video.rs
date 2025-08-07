@@ -1,5 +1,8 @@
 use crossbeam::channel::{self, Receiver, SendError, Sender};
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use windows::{
     Foundation::TypedEventHandler,
     Graphics::{
@@ -37,7 +40,7 @@ pub struct VideoBuffer {
     pub bgra: Vec<u8>,
     pub width: u32,
     pub height: u32,
-    pub timestamp: u64,
+    pub timestamp: Duration,
 }
 
 impl Drop for VideoCaptureApi {
@@ -232,7 +235,7 @@ impl VideoCaptureApi {
                 .to_vec(),
             height: content_size.Height as u32,
             width: content_size.Width as u32,
-            timestamp: instant.elapsed().as_nanos() as u64,
+            timestamp: instant.elapsed(),
         };
 
         unsafe {

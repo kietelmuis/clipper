@@ -276,19 +276,31 @@ impl CaptureMuxer {
         }
     }
 
-    fn process_video_frame(&mut self, frames: i64, video_buffer: VideoBuffer) {
+    fn process_video_frame(&mut self, video_buffer: VideoBuffer) {
         // create empty yuv avframe
         let mut yuv_frame = unsafe { ffmpeg::av_frame_alloc() };
         if yuv_frame.is_null() {
             panic!("Failed to allocate AVFrame!");
         }
 
+        let timebase = (*unsafe { self.video_stream.as_ref().unwrap().encoder.as_ref() }).time_base;
+        let pts = unsafe {
+            ffmpeg::av_rescale_q(
+                video_buffer.timestamp.as_micros() as i64,
+                AVRational {
+                    num: 1,
+                    den: 1_000_000,
+                },
+                timebase,
+            )
+        };
+
         // fill required base avframe data
         unsafe {
             (*yuv_frame).format = ffmpeg::AV_PIX_FMT_YUV420P;
             (*yuv_frame).width = 1920;
             (*yuv_frame).height = 1080;
-            (*yuv_frame).pts = frames;
+            (*yuv_frame).pts = pts;
         };
 
         // free if failed to allocate buffer data
@@ -335,7 +347,6 @@ impl CaptureMuxer {
         sample_format_in: AVSampleFormat,
         sample_format_out: AVSampleFormat,
         sample_rate: i32,
-        frames: i64,
         audio_buffer: AudioBuffer,
     ) {
         // allocate output frame
@@ -373,6 +384,18 @@ impl CaptureMuxer {
             )
         } as i32;
 
+        let timebase = (*unsafe { self.audio_stream.as_ref().unwrap().encoder.as_ref() }).time_base;
+        let pts = unsafe {
+            ffmpeg::av_rescale_q(
+                audio_buffer.time.as_micros() as i64,
+                AVRational {
+                    num: 1,
+                    den: 1_000_000,
+                },
+                timebase,
+            )
+        };
+
         // set its options
         unsafe {
             av_channel_layout_copy(
@@ -382,7 +405,7 @@ impl CaptureMuxer {
             (*output_frame).format = sample_format_out;
             (*output_frame).sample_rate = sample_rate;
             (*output_frame).nb_samples = max_out;
-            (*output_frame).pts = frames;
+            (*output_frame).pts = pts;
         }
 
         // allocate output buffer
@@ -405,7 +428,7 @@ impl CaptureMuxer {
             (*input_frame).format = sample_format_in;
             (*input_frame).sample_rate = sample_rate;
             (*input_frame).nb_samples = sample_amount;
-            (*input_frame).pts = frames;
+            (*input_frame).pts = pts;
         };
 
         // allocate input buffer
@@ -523,52 +546,56 @@ impl CaptureMuxer {
             panic!("failed to write header");
         }
 
-        let mut frames = 0;
-        let mut last_second = 0;
+        let start_time = std::time::Instant::now();
 
         // different from internal instant
-        let record_instant = std::time::Instant::now();
+        let mut last_print = std::time::Instant::now();
+        let print_interval = std::time::Duration::from_secs(1);
 
         // attempt to get video frames
         loop {
-            let video_buffer = self
-                .video_api
-                .video_rx
-                .recv()
-                .expect("failed to receive video bufer");
+            let elapsed = start_time.elapsed();
+            let seconds_elapsed = elapsed.as_secs();
 
-            let audio_buffer = self
-                .audio_api
-                .audio_rx
-                .recv()
-                .expect("failed to receive audio bufer");
-
-            frames += 1;
-
-            let seconds_elapsed = std::time::Instant::now()
-                .duration_since(record_instant)
-                .as_secs();
-
-            // test: stop after 15th frame
+            // Check if we should stop first
             if seconds_elapsed >= 16 {
                 println!("stopping test recording");
                 break;
             }
 
-            if seconds_elapsed != last_second {
+            // Print status every second
+            if last_print.elapsed() >= print_interval {
                 println!("[encoder] recording for {}s", seconds_elapsed);
-                last_second = seconds_elapsed;
+                last_print = std::time::Instant::now();
             }
+
+            // Receive frames without timeout - blocking is acceptable
+            let video_buffer = match self.video_api.video_rx.recv() {
+                Ok(buf) => buf,
+                Err(_) => {
+                    // Handle disconnection
+                    eprintln!("Video channel disconnected");
+                    break;
+                }
+            };
+
+            let audio_buffer = match self.audio_api.audio_rx.recv() {
+                Ok(buf) => buf,
+                Err(_) => {
+                    // Handle disconnection
+                    eprintln!("Audio channel disconnected");
+                    break;
+                }
+            };
 
             // process av
             self.process_audio_frame(
                 sample_format_in,
                 sample_format_out,
                 sample_rate,
-                frames,
                 audio_buffer,
             );
-            self.process_video_frame(frames, video_buffer);
+            self.process_video_frame(video_buffer);
         }
 
         self.stop_recording();
