@@ -3,8 +3,9 @@ use std::time::{Duration, Instant};
 
 use crossbeam::channel::{self, Receiver, SendError};
 
-use windows::Win32::Media::Audio::PKEY_AudioEngine_DeviceFormat;
+use windows::Win32::Media::Audio::{PKEY_AudioEngine_DeviceFormat, WAVEFORMATEXTENSIBLE};
 use windows::Win32::System::Com::CoUninitialize;
+use windows::core::GUID;
 use windows::{
     Win32::{
         Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
@@ -24,7 +25,7 @@ use windows::{
 
 #[derive(Debug)]
 pub struct AudioBuffer {
-    pub buffer: Vec<u8>,
+    pub buffer: Vec<f32>,
     pub time: Duration,
 }
 
@@ -34,6 +35,7 @@ struct InternalCaptureApi {
     stop_rx: channel::Receiver<bool>,
     instant: Arc<Instant>,
     callback: channel::Sender<AudioBuffer>,
+    channels: Option<u16>,
 }
 
 // im dead
@@ -42,9 +44,15 @@ unsafe impl Sync for InternalCaptureApi {}
 
 pub struct AudioCaptureApi {
     pub audio_rx: Receiver<AudioBuffer>,
-    internal: Arc<Mutex<InternalCaptureApi>>,
+    pub sample_rate: Option<u16>,
+    pub channels: Option<u32>,
+
+    inner: Arc<Mutex<InternalCaptureApi>>,
     stop_tx: channel::Sender<bool>,
 }
+
+const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID =
+    GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
 
 // close event handle upon captureapi drop
 impl Drop for InternalCaptureApi {
@@ -65,21 +73,24 @@ impl AudioCaptureApi {
         let (audio_tx, audio_rx) = channel::unbounded::<AudioBuffer>();
         let (stop_tx, stop_rx) = channel::unbounded::<bool>();
 
-        let mut internal_api = Arc::new(Mutex::new(InternalCaptureApi {
+        let internal_api = Arc::new(Mutex::new(InternalCaptureApi {
             event_handle: None,
             capture_client: None,
             stop_rx: stop_rx,
             instant: instant,
             callback: audio_tx,
+            channels: None,
         }));
 
         let mut capture_api = AudioCaptureApi {
             audio_rx,
-            internal: internal_api.clone(),
+            sample_rate: None,
+            channels: None,
+            inner: internal_api.clone(),
             stop_tx,
         };
 
-        internal_api.lock().unwrap().init();
+        capture_api.init();
 
         let inner = internal_api.clone();
         std::thread::spawn(move || {
@@ -99,9 +110,7 @@ impl AudioCaptureApi {
         self.stop_tx.send(false)?;
         Ok(())
     }
-}
 
-impl InternalCaptureApi {
     fn init(&mut self) {
         // create audio device enumerator
         let enumerator = unsafe {
@@ -129,21 +138,55 @@ impl InternalCaptureApi {
             .expect("failed to get audio device name");
         println!("[audio] using device: {}", name);
 
-        let _audio_engine = unsafe { property_store.GetValue(&PKEY_AudioEngine_DeviceFormat) }
-            .expect("failed toget audio engine");
-
         // create and activate audio client on device
         let audio_client = unsafe { device.Activate::<IAudioClient>(CLSCTX_ALL, None) }
             .expect("couldn't activate audio device");
+
+        // Get format directly from audio client
+        let format_ptr = unsafe { audio_client.GetMixFormat().unwrap() };
+        let wave_format = unsafe { format_ptr.as_ref().expect("Null format pointer") };
+
+        // Check format details
+        let sample_rate = wave_format.nSamplesPerSec;
+        let channels = wave_format.nChannels;
+        println!(
+            "[Audio] Channels: {}, Sample Rate: {}",
+            channels, sample_rate
+        );
+
+        self.inner.lock().unwrap().channels = Some(channels);
+
+        // Validate format type
+        let is_float = match wave_format.wFormatTag {
+            wave_format_ieee_float => true,
+            wave_format_extensible => {
+                // Cast to WAVEFORMATEXTENSIBLE and read unaligned
+                let wave_format_ext_ptr =
+                    unsafe { format_ptr.cast::<WAVEFORMATEXTENSIBLE>().as_ref() }.unwrap();
+
+                // SAFETY: We know the pointer is valid and we're using read_unaligned
+                let sub_format = unsafe {
+                    // Get pointer to SubFormat field without creating a reference
+                    let sub_format_ptr = std::ptr::addr_of!((*wave_format_ext_ptr).SubFormat);
+                    std::ptr::read_unaligned(sub_format_ptr)
+                };
+
+                sub_format == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+            }
+            _ => false,
+        };
+
+        if !is_float {
+            panic!("Unsupported audio format - expected IEEE Float");
+        }
+
         unsafe {
             audio_client.Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
                 AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_LOOPBACK, // wait for event and
-                1000000,                                                          // 100ns
+                1000000,                                                          // 100ms buffer
                 0,
-                audio_client
-                    .GetMixFormat()
-                    .expect("couldn't get audio mix format"),
+                format_ptr,
                 None,
             )
         }
@@ -154,21 +197,18 @@ impl InternalCaptureApi {
             unsafe { CreateEventW(None, true, false, None) }.expect("couldn't create event handle");
         unsafe { audio_client.SetEventHandle(event) }.expect("couldn't set audio event handle");
 
-        self.event_handle = Some(event);
-
-        // get device buffer size
-        let buffer_size =
-            unsafe { audio_client.GetBufferSize() }.expect("couldn't get buffer size");
-        println!("[audio] buffersize: {}Hz", buffer_size);
+        self.inner.lock().unwrap().event_handle = Some(event);
 
         let audio_capture_client = unsafe { audio_client.GetService::<IAudioCaptureClient>() }
             .expect("couldn't get audio capture client");
 
         unsafe { audio_client.Start() }.expect("failed to start audio client");
 
-        self.capture_client = Some(audio_capture_client);
+        self.inner.lock().unwrap().capture_client = Some(audio_capture_client);
     }
+}
 
+impl InternalCaptureApi {
     fn event_loop(&mut self) {
         let capture_client = self
             .capture_client
@@ -176,6 +216,12 @@ impl InternalCaptureApi {
             .expect("audio capture client not ready!");
 
         let handle = self.event_handle.expect("event handle missing");
+
+        const FRAME_SIZE: usize = 1024; // AAC requires 1024 samples per frame
+        let samples_per_frame = FRAME_SIZE * self.channels.unwrap() as usize;
+
+        let mut staging_buf = Vec::with_capacity(samples_per_frame * 2);
+        let mut last_time = self.instant.elapsed();
 
         loop {
             unsafe {
@@ -211,28 +257,39 @@ impl InternalCaptureApi {
                 }
 
                 // process audio data here
-                // let sample_count = num_frames as usize * 2;
-                // let samples =
-                //     unsafe { std::slice::from_raw_parts(data_ptr as *const i16, sample_count) };
+                // SAFETY: WASAPI guarantees the buffer contains float samples
+                let samples = unsafe {
+                    std::slice::from_raw_parts(
+                        data_ptr as *const f32,
+                        num_frames as usize * self.channels.unwrap() as usize,
+                    )
+                };
 
-                // let sum: i32 = samples.iter().map(|&s| (s as i32).abs()).sum();
-                // if sum > 0 {
-                //     println!("audio detected");
-                // }
+                // Process samples (example: simple volume adjustment)
+                let processed_samples: Vec<f32> = samples
+                    .iter()
+                    .map(|sample| sample * 0.8) // Reduce volume by 20%
+                    .collect();
 
-                let bytes_per_frame = 2 * 2; // 16-bit + 2 channels = 4 bytes
-                let buffer_len = (num_frames as usize) * bytes_per_frame; // number of frames to encode * bytes per frame
+                staging_buf.extend_from_slice(&processed_samples);
 
-                let buffer_slice = unsafe { std::slice::from_raw_parts(data_ptr, buffer_len) };
-                if let Err(e) = self.callback.send(AudioBuffer {
-                    buffer: buffer_slice.into(),
-                    time: self.instant.elapsed(),
-                }) {
-                    eprintln!("failed to send audio callback: {}", e);
-                }
-
+                // Release buffer
                 unsafe { capture_client.ReleaseBuffer(num_frames) }
                     .expect("failed to release buffer");
+
+                // Send complete frames
+                while staging_buf.len() >= samples_per_frame {
+                    let frame = AudioBuffer {
+                        buffer: staging_buf.drain(..samples_per_frame).collect(),
+                        time: last_time,
+                    };
+
+                    last_time = self.instant.elapsed();
+
+                    if let Err(e) = self.callback.send(frame) {
+                        eprintln!("Failed to send audio frame: {}", e);
+                    }
+                }
             }
 
             unsafe {
