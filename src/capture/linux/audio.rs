@@ -1,11 +1,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use std::thread;
-
 use crossbeam::channel::{self, Receiver, Sender, SendError};
-use pipewire::{self as pw, properties::properties};
-use pipewire::main_loop::MainLoop;
-use pipewire::context::Context;
+use std::f32::consts::PI;
+
 
 #[derive(Debug)]
 pub struct AudioBuffer {
@@ -13,81 +10,65 @@ pub struct AudioBuffer {
     pub time: Duration,
 }
 
-// this is going to the muxer
 pub struct AudioCaptureApi {
     pub audio_rx: Receiver<AudioBuffer>,
-    audio_tx: Sender<AudioBuffer>,
-    running: Arc<Mutex<bool>>,
+    pub sample_rate: u32,
+    pub channels: u32,
+    stop_tx: Sender<bool>,
     instant: Arc<Instant>,
 }
 
 impl AudioCaptureApi {
     pub fn new(instant: Arc<Instant>) -> Self {
-        let (tx, rx) = channel::unbounded::<AudioBuffer>();
-        Self {
-            audio_rx: rx,
-            audio_tx: tx,
-            running: Arc::new(Mutex::new(false)),
+        let (audio_tx, audio_rx) = channel::unbounded::<AudioBuffer>();
+        let (stop_tx, stop_rx) = channel::unbounded::<bool>();
+
+        let sample_rate = 48000;
+        let channels = 1;
+
+        // Spawn thread to send dummy beep data (always running)
+        let instant_clone = instant.clone();
+        std::thread::spawn(move || {
+            let mut t: f32 = 0.0;
+            let mut freq: f32 = 440.0;
+            let frame_size = 1024;
+            loop {
+                // Generate a simple beep that changes frequency
+                let mut buffer = Vec::with_capacity(frame_size);
+                for _ in 0..frame_size {
+                    let sample = (t * freq * 2.0 * PI).sin() as f32 * 0.2;
+                    buffer.push(sample);
+                    t += 1.0 / sample_rate as f32;
+                }
+                // Change frequency every second
+                freq = 440.0 + ((instant_clone.elapsed().as_secs() % 5) as f32) * 110.0;
+                let audio_buffer = AudioBuffer {
+                    buffer,
+                    time: instant_clone.elapsed(),
+                };
+                if audio_tx.send(audio_buffer).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        AudioCaptureApi {
+            audio_rx,
+            sample_rate,
+            channels,
+            stop_tx,
             instant,
         }
     }
 
     pub fn start(&mut self) -> Result<(), SendError<bool>> {
-        let running = self.running.clone();
-        let tx = self.audio_tx.clone();
-        let instant = self.instant.clone();
-
-        *running.lock().unwrap() = true;
-
-        thread::spawn(move || {
-            // Initialize PipeWire
-            pw::init();
-            let main_loop = MainLoop::new(None).unwrap();
-            let context = Context::new(&main_loop).unwrap();
-            let core = context.connect(None).unwrap();
-
-            let stream = pw::stream::Stream::new(
-                &core,
-                "audio-capture",
-                properties! {
-                    "media.role" => "Capture",
-                },
-            ).unwrap();
-
-            // TODO: Setup Pipewire stream parameters for audio format and direction
-            // For now, this is a stub to allow compilation
-
-            // TODO: Set process callback for Pipewire stream
-            // For now, simulate audio data every 100ms
-            loop {
-                if !*running.lock().unwrap() {
-                    break;
-                }
-                let time = instant.elapsed();
-                let buffer = AudioBuffer {
-                    buffer: vec![0.0; 48000 * 2 / 10], // Dummy audio data for 100ms
-                    time,
-                };
-                let _ = tx.send(buffer);
-                thread::sleep(Duration::from_millis(100));
-            }
-
-            main_loop.run();
-        });
-
+        self.stop_tx.send(true)?;
         Ok(())
     }
 
     pub fn stop(&mut self) -> Result<(), SendError<bool>> {
-        *self.running.lock().unwrap() = false;
+        self.stop_tx.send(false)?;
         Ok(())
-    }
-
-    fn event_loop(&mut self) {
-        // Not needed, handled by PipeWire main loop
-    }
-
-    fn init(&mut self) {
-        // Not needed, handled in start()
     }
 }
