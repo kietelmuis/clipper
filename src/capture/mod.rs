@@ -1,17 +1,17 @@
 use rusty_ffmpeg::ffi::{
-    self as ffmpeg, AV_CHANNEL_ORDER_UNSPEC, AV_CODEC_ID_AAC, AV_CODEC_ID_H264, AV_CODEC_ID_HEVC,
-    AV_PIX_FMT_YUV420P, AV_SAMPLE_FMT_FLT, AV_SAMPLE_FMT_FLTP, AV_SAMPLE_FMT_U8, AVChannelLayout,
-    AVChannelLayout__bindgen_ty_1, AVCodec, AVCodecContext, AVCodecID, AVFormatContext, AVFrame,
-    AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_VIDEO, AVPacket, AVRational, AVSampleFormat, AVStream,
-    SwrContext, SwsContext, av_channel_layout_copy, av_channel_layout_default, av_frame_copy,
-    av_frame_get_buffer, av_packet_alloc, avcodec_alloc_context3, avcodec_parameters_from_context,
-    avformat_new_stream, swr_alloc, swr_get_out_samples,
+    self as ffmpeg, AV_CHANNEL_ORDER_UNSPEC, AV_CODEC_ID_AAC, AV_CODEC_ID_H264,
+    AV_PIX_FMT_YUV420P, AV_SAMPLE_FMT_FLT, AV_SAMPLE_FMT_FLTP, AVChannelLayout,
+    AVChannelLayout__bindgen_ty_1, AVCodecContext, AVCodecID, AVFormatContext, AVFrame,
+    AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_VIDEO, AVRational, AVSampleFormat, AVStream,
+    SwrContext, SwsContext, av_channel_layout_copy, av_channel_layout_default,
+    av_frame_get_buffer, avcodec_alloc_context3, avcodec_parameters_from_context,
+    avformat_new_stream, swr_get_out_samples,
 };
 
-use crossbeam::channel::{self, SendError};
+#[cfg(windows)]
 use windows::Win32::UI::Shell::PAI_EXPIRETIME;
 
-use std::{ffi::CString, ptr::NonNull, sync::Arc, thread::JoinHandle, time::Instant};
+use std::{ffi::CString, ptr::NonNull, sync::Arc, time::Instant};
 
 use crate::capture::{
     audio::{AudioBuffer, AudioCaptureApi},
@@ -141,7 +141,7 @@ impl CaptureMuxer {
 
         self.audio_stream = Some(self.create_audio_muxstream(
             format_context,
-            audio_format,
+            audio_format as i32,
             sample_format_out,
             sample_rate,
             audio_timebase,
@@ -165,7 +165,7 @@ impl CaptureMuxer {
         sample_rate: i32,
         timebase: AVRational,
     ) -> MuxStream {
-        let codec = unsafe { ffmpeg::avcodec_find_encoder(codec_id) };
+    let codec = unsafe { ffmpeg::avcodec_find_encoder(codec_id as u32) };
         if codec.is_null() {
             panic!("failed to find codec");
         }
@@ -191,7 +191,7 @@ impl CaptureMuxer {
             (*encoder_ptr).ch_layout = channel_layout;
             (*encoder_ptr).sample_fmt = sample_format;
             (*encoder_ptr).sample_rate = sample_rate;
-            (*encoder_ptr).codec_id = codec_id;
+            (*encoder_ptr).codec_id = codec_id as u32;
             (*encoder_ptr).codec_type = AVMEDIA_TYPE_AUDIO;
             (*encoder_ptr).time_base = timebase;
         }
