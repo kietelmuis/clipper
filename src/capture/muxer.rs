@@ -302,7 +302,7 @@ impl CaptureMuxer {
                     .sws_context
                     .unwrap()
                     .as_ptr(),
-                [video_buffer.buffer.as_ptr()].as_ptr(),
+                [video_buffer.bgra.as_ptr()].as_ptr(),
                 [1920 * 4].as_ptr(),
                 0,
                 1080,
