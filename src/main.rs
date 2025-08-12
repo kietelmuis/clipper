@@ -1,10 +1,10 @@
 use rdev::{Event, EventType, listen};
 use std::time::Duration;
 
+use crate::capture::muxer::{CaptureMuxer, CaptureSettings};
+
 mod capture;
 mod config;
-
-use capture::{CaptureMuxer, CaptureSettings};
 
 fn callback(event: Event) {
     if event.event_type == EventType::KeyPress(rdev::Key::F9) {
@@ -22,7 +22,7 @@ fn main() {
         }
     });
 
-    let mut muxer = CaptureMuxer::new(CaptureSettings {
+    CaptureMuxer::new(CaptureSettings {
         resolution: config.resolution,
         fps: config.fps,
     });
