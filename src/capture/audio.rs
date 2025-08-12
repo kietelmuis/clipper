@@ -1,11 +1,16 @@
+use std::env::consts::OS;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam::channel::{self, Receiver, SendError};
 
-use windows::Win32::Media::Audio::WAVEFORMATEXTENSIBLE;
+#[cfg(windows)]
+use windows::Win32::Media::Audio::{PKEY_AudioEngine_DeviceFormat, WAVEFORMATEXTENSIBLE};
+#[cfg(windows)]
 use windows::Win32::System::Com::CoUninitialize;
+#[cfg(windows)]
 use windows::core::GUID;
+#[cfg(windows)]
 use windows::{
     Win32::{
         Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
@@ -30,7 +35,9 @@ pub struct AudioBuffer {
 }
 
 struct InternalCaptureApi {
+    #[cfg(windows)]
     event_handle: Option<HANDLE>,
+    #[cfg(windows)]
     capture_client: Option<IAudioCaptureClient>,
     stop_rx: channel::Receiver<bool>,
     instant: Arc<Instant>,
@@ -38,8 +45,9 @@ struct InternalCaptureApi {
     channels: Option<u16>,
 }
 
-// im dead
+#[cfg(windows)]
 unsafe impl Send for InternalCaptureApi {}
+#[cfg(windows)]
 unsafe impl Sync for InternalCaptureApi {}
 
 #[derive(Clone)]
@@ -52,10 +60,12 @@ pub struct AudioCaptureApi {
     stop_tx: channel::Sender<bool>,
 }
 
+#[cfg(windows)]
 const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID =
     GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
 
 // close event handle upon captureapi drop
+#[cfg(windows)]
 impl Drop for InternalCaptureApi {
     fn drop(&mut self) {
         println!("cleaning audio api");
@@ -69,13 +79,22 @@ impl Drop for InternalCaptureApi {
     }
 }
 
+#[cfg(not(windows))]
+impl Drop for InternalCaptureApi {
+    fn drop(&mut self) {
+        println!("cleaning audio api (linux stub)");
+    }
+}
+
 impl AudioCaptureApi {
     pub fn new(instant: Arc<Instant>) -> Self {
         let (audio_tx, audio_rx) = channel::unbounded::<AudioBuffer>();
         let (stop_tx, stop_rx) = channel::unbounded::<bool>();
 
         let internal_api = Arc::new(Mutex::new(InternalCaptureApi {
+            #[cfg(windows)]
             event_handle: None,
+            #[cfg(windows)]
             capture_client: None,
             stop_rx: stop_rx,
             instant: instant,
@@ -91,27 +110,37 @@ impl AudioCaptureApi {
             stop_tx,
         };
 
-        capture_api.init();
+        // Use OS constant from main.rs
+        if OS == "windows" {
+            capture_api.init();
 
-        let inner = internal_api.clone();
-        std::thread::spawn(move || {
-            let mut guard = inner.lock().unwrap();
-            guard.event_loop();
-        });
+            let inner = internal_api.clone();
+            std::thread::spawn(move || {
+                let mut guard = inner.lock().unwrap();
+                guard.event_loop();
+            });
+        } else {
+            println!("Audio capture not supported on this platform (Linux stub)");
+        }
 
         capture_api
     }
 
-    pub fn start(&self) -> Result<(), SendError<bool>> {
-        self.stop_tx.send(true)?;
+    pub fn start(&mut self) -> Result<(), SendError<bool>> {
+        if OS == "windows" {
+            self.stop_tx.send(true)?;
+        }
         Ok(())
     }
 
-    pub fn stop(&self) -> Result<(), SendError<bool>> {
-        self.stop_tx.send(false)?;
+    pub fn stop(&mut self) -> Result<(), SendError<bool>> {
+        if OS == "windows" {
+            self.stop_tx.send(false)?;
+        }
         Ok(())
     }
 
+    #[cfg(windows)]
     fn init(&mut self) {
         // create audio device enumerator
         let enumerator = unsafe {
@@ -204,8 +233,15 @@ impl AudioCaptureApi {
 
         self.inner.lock().unwrap().capture_client = Some(audio_capture_client);
     }
+
+    #[cfg(not(windows))]
+    fn init(&mut self) {
+        // Linux stub
+        println!("AudioCaptureApi::init() called on non-Windows platform");
+    }
 }
 
+#[cfg(windows)]
 impl InternalCaptureApi {
     fn event_loop(&mut self) {
         let capture_client = self
@@ -294,5 +330,12 @@ impl InternalCaptureApi {
                 ResetEvent(handle).expect("failed to reset event");
             }
         }
+    }
+}
+
+#[cfg(not(windows))]
+impl InternalCaptureApi {
+    fn event_loop(&mut self) {
+        println!("InternalCaptureApi::event_loop() called on non-Windows platform");
     }
 }

@@ -1,8 +1,10 @@
-use crossbeam::channel::{self, Receiver, Sender};
+use crossbeam::channel::{self, Receiver};
 use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+
+#[cfg(windows)]
 use windows::{
     Foundation::{TimeSpan, TypedEventHandler},
     Graphics::{
@@ -43,6 +45,7 @@ pub struct VideoBuffer {
     pub timestamp: Duration,
 }
 
+#[cfg(windows)]
 impl Drop for VideoCaptureApi {
     fn drop(&mut self) {
         println!("cleaning video api");
@@ -50,17 +53,7 @@ impl Drop for VideoCaptureApi {
     }
 }
 
-struct InternalCaptureApi {
-    frame_pool: Option<Direct3D11CaptureFramePool>,
-    frame_handler: Option<TypedEventHandler<Direct3D11CaptureFramePool, IInspectable>>,
-    capture_session: Option<GraphicsCaptureSession>,
-}
-
-// im dead
-unsafe impl Send for InternalCaptureApi {}
-unsafe impl Sync for InternalCaptureApi {}
-
-#[derive(Clone)]
+#[cfg(windows)]
 pub struct VideoCaptureApi {
     pub video_rx: Receiver<VideoBuffer>,
 
@@ -69,6 +62,7 @@ pub struct VideoCaptureApi {
     callback: Arc<Sender<VideoBuffer>>,
 }
 
+#[cfg(windows)]
 impl VideoCaptureApi {
     pub fn new(instant: Arc<Instant>) -> Self {
         let (video_tx, video_rx) = channel::unbounded::<VideoBuffer>();
@@ -268,5 +262,28 @@ impl VideoCaptureApi {
         if let Err(e) = callback.send(buffer) {
             println!("Failed to send video buffer: {:?}", e)
         }
+    }
+}
+
+#[cfg(not(windows))]
+pub struct VideoCaptureApi {
+    pub video_rx: Receiver<VideoBuffer>,
+}
+
+#[cfg(not(windows))]
+impl VideoCaptureApi {
+    pub fn new(_instant: Arc<Instant>) -> Self {
+        let (_video_tx, video_rx) = channel::unbounded::<VideoBuffer>();
+        Self { video_rx }
+    }
+
+    pub fn start(&mut self) -> Result<(), ()> {
+        // No-op for non-Windows
+        Ok(())
+    }
+
+    pub fn stop(&mut self) -> Result<(), ()> {
+        // No-op for non-Windows
+        Ok(())
     }
 }
