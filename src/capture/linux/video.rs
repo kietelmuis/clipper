@@ -22,17 +22,19 @@ impl Drop for VideoCaptureApi {
 pub struct VideoCaptureApi {
     pub video_rx: Receiver<VideoBuffer>,
 
+    stop_tx: Sender<bool>,
     instant: Arc<Instant>,
     callback: Arc<Sender<VideoBuffer>>,
 }
 
 impl VideoCaptureApi {
     pub fn new(instant: Arc<Instant>) -> Self {
+        let (stop_tx, stop_rx) = channel::unbounded::<bool>();
         let (video_tx, video_rx) = channel::unbounded::<VideoBuffer>();
 
         let mut capture_api = Self {
             video_rx,
-
+            stop_tx,
             instant,
             callback: Arc::new(video_tx),
         };
@@ -41,11 +43,13 @@ impl VideoCaptureApi {
         capture_api
     }
 
-    pub fn start(&mut self) -> Result<()> {
+    pub fn start(&mut self) -> Result<(), SendError<bool>> {
+        self.stop_tx.send(true)?;
         Ok(())
     }
 
-    pub fn stop(&mut self) -> Result<()> {
+    pub fn stop(&mut self) -> Result<(), SendError<bool>> {
+        self.stop_tx.send(false)?;
         Ok(())
     }
 
