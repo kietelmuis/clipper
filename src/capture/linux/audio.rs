@@ -1,7 +1,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use std::thread;
 
-use crossbeam::channel::{self, Receiver, SendError};
+use crossbeam::channel::{self, Receiver, Sender, SendError};
+use pipewire::{self as pw, properties::properties};
+use pipewire::main_loop::MainLoop;
+use pipewire::context::Context;
 
 #[derive(Debug)]
 pub struct AudioBuffer {
@@ -9,45 +13,81 @@ pub struct AudioBuffer {
     pub time: Duration,
 }
 
-// handle all pointers because we are gonna give the external to the muxer
-struct InternalCaptureApi {}
-
-// required (to send), but since inner is private the unsafe pointers inside wont be accessed
-unsafe impl Send for InternalCaptureApi {}
-unsafe impl Sync for InternalCaptureApi {}
-
 // this is going to the muxer
 pub struct AudioCaptureApi {
     pub audio_rx: Receiver<AudioBuffer>,
-    pub sample_rate: Option<u16>,
-    pub channels: Option<u32>,
-
-    inner: Arc<Mutex<InternalCaptureApi>>,
-    stop_tx: channel::Sender<bool>,
-}
-
-impl Drop for InternalCaptureApi {
-    fn drop(&mut self) {
-        println!("cleaning audio api");
-    }
+    audio_tx: Sender<AudioBuffer>,
+    running: Arc<Mutex<bool>>,
+    instant: Arc<Instant>,
 }
 
 impl AudioCaptureApi {
-    pub fn new(instant: Arc<Instant>) -> Self {}
+    pub fn new(instant: Arc<Instant>) -> Self {
+        let (tx, rx) = channel::unbounded::<AudioBuffer>();
+        Self {
+            audio_rx: rx,
+            audio_tx: tx,
+            running: Arc::new(Mutex::new(false)),
+            instant,
+        }
+    }
 
     pub fn start(&mut self) -> Result<(), SendError<bool>> {
-        self.stop_tx.send(true)?;
+        let running = self.running.clone();
+        let tx = self.audio_tx.clone();
+        let instant = self.instant.clone();
+
+        *running.lock().unwrap() = true;
+
+        thread::spawn(move || {
+            // Initialize PipeWire
+            pw::init();
+            let main_loop = MainLoop::new(None).unwrap();
+            let context = Context::new(&main_loop).unwrap();
+            let core = context.connect(None).unwrap();
+
+            let stream = pw::stream::Stream::new(
+                &core,
+                "audio-capture",
+                properties! {
+                    "media.role" => "Capture",
+                },
+            ).unwrap();
+
+            // TODO: Setup Pipewire stream parameters for audio format and direction
+            // For now, this is a stub to allow compilation
+
+            // TODO: Set process callback for Pipewire stream
+            // For now, simulate audio data every 100ms
+            loop {
+                if !*running.lock().unwrap() {
+                    break;
+                }
+                let time = instant.elapsed();
+                let buffer = AudioBuffer {
+                    buffer: vec![0.0; 48000 * 2 / 10], // Dummy audio data for 100ms
+                    time,
+                };
+                let _ = tx.send(buffer);
+                thread::sleep(Duration::from_millis(100));
+            }
+
+            main_loop.run();
+        });
+
         Ok(())
     }
 
     pub fn stop(&mut self) -> Result<(), SendError<bool>> {
-        self.stop_tx.send(false)?;
+        *self.running.lock().unwrap() = false;
         Ok(())
     }
 
-    fn init(&mut self) {}
-}
+    fn event_loop(&mut self) {
+        // Not needed, handled by PipeWire main loop
+    }
 
-impl InternalCaptureApi {
-    fn event_loop(&mut self) {}
+    fn init(&mut self) {
+        // Not needed, handled in start()
+    }
 }
