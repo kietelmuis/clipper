@@ -2,9 +2,9 @@ use std::{sync::Arc, time::Instant};
 
 use crossbeam::channel::{SendError, Sender};
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 use crate::capture::linux::video::VideoCaptureApi as LinuxCaptureApi;
-#[cfg(not(windows))]
+#[cfg(unix)]
 pub use crate::capture::linux::video::{VideoBuffer, VideoCaptureApi};
 
 #[cfg(windows)]

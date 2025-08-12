@@ -2,9 +2,9 @@ use std::{sync::Arc, time::Instant};
 
 use crossbeam::channel::{SendError, Sender};
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 use crate::capture::linux::audio::AudioCaptureApi as LinuxCaptureApi;
-#[cfg(not(windows))]
+#[cfg(unix)]
 pub use crate::capture::linux::audio::{AudioBuffer, AudioCaptureApi};
 
 #[cfg(windows)]
@@ -22,7 +22,7 @@ impl AudioCapture {
         WindowsCaptureApi::new(instant)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     pub fn new(instant: Arc<Instant>) -> LinuxCaptureApi {
         LinuxCaptureApi::new(instant)
     }

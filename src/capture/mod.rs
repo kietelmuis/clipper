@@ -1,4 +1,4 @@
-#[cfg(not(windows))]
+#[cfg(unix)]
 mod linux;
 #[cfg(windows)]
 mod windows;
