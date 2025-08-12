@@ -7,7 +7,7 @@ use rusty_ffmpeg::ffi::{
     avcodec_parameters_from_context, avformat_new_stream, swr_get_out_samples,
 };
 
-use std::{ffi::CString, ptr::NonNull, sync::Arc, time::Instant};
+use std::{collections::VecDeque, ffi::CString, ptr::NonNull, sync::Arc, time::Instant};
 
 use crate::capture::{
     audio::{AudioBuffer, AudioCaptureApi},
@@ -37,7 +37,6 @@ pub struct CaptureMuxer {
     // data structs for audio/video
     audio_stream: Option<MuxStream>,
     video_stream: Option<MuxStream>,
-
     format_context: Option<NonNull<AVFormatContext>>,
 
     instant: Arc<Instant>,
