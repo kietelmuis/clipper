@@ -1,9 +1,9 @@
 use rdev::{Event, EventType, listen};
 
+use crate::capture::muxer::{CaptureMuxer, CaptureSettings};
+
 mod capture;
 mod config;
-
-use capture::*;
 
 fn callback(event: Event) {
     if event.event_type == EventType::KeyPress(rdev::Key::F9) {
@@ -20,7 +20,7 @@ fn main() {
         }
     });
 
-    capture::CaptureMuxer::new(CaptureSettings {
+    CaptureMuxer::new(CaptureSettings {
         resolution: config.resolution,
         fps: config.fps,
     })
