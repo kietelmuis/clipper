@@ -159,7 +159,7 @@ impl CaptureMuxer {
         sample_rate: i32,
         timebase: AVRational,
     ) -> MuxStream {
-        let codec = unsafe { ffmpeg::avcodec_find_encoder(codec_id) };
+        let codec = unsafe { ffmpeg::avcodec_find_encoder(codec_id as u32) };
         if codec.is_null() {
             panic!("failed to find codec");
         }
@@ -185,10 +185,10 @@ impl CaptureMuxer {
             (*encoder_ptr).ch_layout = channel_layout;
             (*encoder_ptr).sample_fmt = sample_format;
             (*encoder_ptr).sample_rate = sample_rate;
-            (*encoder_ptr).codec_id = codec_id;
+            (*encoder_ptr).codec_id = codec_id as u32;
             (*encoder_ptr).codec_type = AVMEDIA_TYPE_AUDIO;
             (*encoder_ptr).time_base = timebase;
-        }
+        } 
 
         // open the encoder
         if unsafe { ffmpeg::avcodec_open2(encoder_ptr, codec, std::ptr::null_mut()) } < 0 {
@@ -302,7 +302,7 @@ impl CaptureMuxer {
                     .sws_context
                     .unwrap()
                     .as_ptr(),
-                [video_buffer.bgra.as_ptr()].as_ptr(),
+                [video_buffer.buffer.as_ptr()].as_ptr(),
                 [1920 * 4].as_ptr(),
                 0,
                 1080,

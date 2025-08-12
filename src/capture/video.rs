@@ -22,7 +22,7 @@ impl VideoCapture {
         WindowsCaptureApi::new(instant)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     pub fn new(instant: Arc<Instant>) -> LinuxCaptureApi {
         LinuxCaptureApi::new(instant)
     }
