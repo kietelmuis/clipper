@@ -1,10 +1,10 @@
-use crossbeam::channel::{self, Receiver, SendError, Sender};
+use crossbeam::channel::{self, Receiver, Sender};
 use std::{
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use windows::{
-    Foundation::TypedEventHandler,
+    Foundation::{TimeSpan, TypedEventHandler},
     Graphics::{
         Capture::{
             Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem,
@@ -26,7 +26,7 @@ use windows::{
                 D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
                 ID3D11Texture2D,
             },
-            Dxgi::IDXGIDevice,
+            Dxgi::{DXGI_FRAME_STATISTICS, IDXGIDevice},
         },
         System::WinRT::Direct3D11::{
             CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
@@ -50,15 +50,23 @@ impl Drop for VideoCaptureApi {
     }
 }
 
+struct InternalCaptureApi {
+    frame_pool: Option<Direct3D11CaptureFramePool>,
+    frame_handler: Option<TypedEventHandler<Direct3D11CaptureFramePool, IInspectable>>,
+    capture_session: Option<GraphicsCaptureSession>,
+}
+
+// im dead
+unsafe impl Send for InternalCaptureApi {}
+unsafe impl Sync for InternalCaptureApi {}
+
+#[derive(Clone)]
 pub struct VideoCaptureApi {
     pub video_rx: Receiver<VideoBuffer>,
 
+    inner: Arc<InternalCaptureApi>,
     instant: Arc<Instant>,
     callback: Arc<Sender<VideoBuffer>>,
-
-    frame_pool: Option<Arc<Direct3D11CaptureFramePool>>,
-    frame_handler: Option<TypedEventHandler<Direct3D11CaptureFramePool, IInspectable>>,
-    capture_session: Option<GraphicsCaptureSession>,
 }
 
 impl VideoCaptureApi {
@@ -71,24 +79,26 @@ impl VideoCaptureApi {
             instant,
             callback: Arc::new(video_tx),
 
-            frame_pool: None,
-            frame_handler: None,
-            capture_session: None,
+            inner: Arc::new(InternalCaptureApi {
+                capture_session: None,
+                frame_handler: None,
+                frame_pool: None,
+            }),
         };
 
         capture_api.init();
         capture_api
     }
 
-    pub fn start(&mut self) -> windows::core::Result<()> {
-        if let Some(session) = &self.capture_session {
+    pub fn start(&self) -> windows::core::Result<()> {
+        if let Some(session) = self.inner.capture_session.clone() {
             session.StartCapture()?;
         }
         Ok(())
     }
 
-    pub fn stop(&mut self) -> windows::core::Result<()> {
-        if let Some(session) = &self.capture_session {
+    pub fn stop(&self) -> windows::core::Result<()> {
+        if let Some(session) = self.inner.capture_session.clone() {
             session.Close()?;
         }
         Ok(())
@@ -129,19 +139,15 @@ impl VideoCaptureApi {
             GraphicsCaptureItem::TryCreateFromDisplayId(DisplayId { Value: 0 }).expect("ok");
 
         // create frame pool with d3d devie and monitor size
-        let frame_pool = Arc::new(
-            Direct3D11CaptureFramePool::CreateFreeThreaded(
-                &directx_device,
-                DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                3,
-                capture_item.Size().expect("failed to get monitor size"),
-            )
-            .expect("failed to create frame pool"),
-        );
+        let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+            &directx_device,
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            3,
+            capture_item.Size().expect("failed to get monitor size"),
+        )
+        .expect("failed to create frame pool");
 
-        // save framepool in struct to avoid out of scope
-        self.frame_pool = Some(frame_pool.clone());
-
+        let previous = Arc::new(Mutex::new(Instant::now()));
         let instant_clone = self.instant.clone();
         let callback_clone = self.callback.clone();
 
@@ -156,6 +162,7 @@ impl VideoCaptureApi {
                             device.clone(),
                             device_context.clone(),
                             instant_clone.clone(),
+                            previous.clone(),
                             callback_clone.clone(),
                         );
                     }
@@ -163,23 +170,28 @@ impl VideoCaptureApi {
                 Ok(())
             },
         );
-        self.frame_handler = Some(handler);
 
         frame_pool
-            .FrameArrived(self.frame_handler.as_ref().expect("handler not set"))
+            .FrameArrived(&handler)
             .expect("failed to set frame arrived");
 
         // create and start capture session
         let capture_session = frame_pool
             .CreateCaptureSession(&capture_item)
             .expect("failed to create capture session");
+        capture_session
+            .SetIsBorderRequired(false)
+            .expect("failed to disable fuckass border");
 
         capture_session
             .StartCapture()
             .expect("failed to start capturing");
 
-        // store capture session to keep it alive
-        self.capture_session = Some(capture_session);
+        self.inner = Arc::new(InternalCaptureApi {
+            capture_session: Some(capture_session),
+            frame_handler: Some(handler),
+            frame_pool: Some(frame_pool),
+        });
     }
 
     fn handle_frame(
@@ -187,8 +199,16 @@ impl VideoCaptureApi {
         device: Arc<ID3D11Device>,
         device_context: Arc<ID3D11DeviceContext>,
         instant: Arc<Instant>,
+        previous: Arc<Mutex<Instant>>,
         callback: Arc<Sender<VideoBuffer>>,
     ) {
+        let mut guard = previous.lock().unwrap();
+        let delta_sec = guard.elapsed().as_secs_f64();
+        let fps = 1.0 / delta_sec;
+        println!("[direct11] {:.2} fps | {:.2} ms", fps, delta_sec);
+
+        *guard = Instant::now();
+
         let d3d_surface: IDirect3DSurface = frame.Surface().expect("failed to get frame surface");
 
         let dxgi_interface_access: IDirect3DDxgiInterfaceAccess = d3d_surface

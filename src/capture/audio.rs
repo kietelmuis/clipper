@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam::channel::{self, Receiver, SendError};
 
-use windows::Win32::Media::Audio::{PKEY_AudioEngine_DeviceFormat, WAVEFORMATEXTENSIBLE};
+use windows::Win32::Media::Audio::WAVEFORMATEXTENSIBLE;
 use windows::Win32::System::Com::CoUninitialize;
 use windows::core::GUID;
 use windows::{
@@ -42,6 +42,7 @@ struct InternalCaptureApi {
 unsafe impl Send for InternalCaptureApi {}
 unsafe impl Sync for InternalCaptureApi {}
 
+#[derive(Clone)]
 pub struct AudioCaptureApi {
     pub audio_rx: Receiver<AudioBuffer>,
     pub sample_rate: Option<u16>,
@@ -101,12 +102,12 @@ impl AudioCaptureApi {
         capture_api
     }
 
-    pub fn start(&mut self) -> Result<(), SendError<bool>> {
+    pub fn start(&self) -> Result<(), SendError<bool>> {
         self.stop_tx.send(true)?;
         Ok(())
     }
 
-    pub fn stop(&mut self) -> Result<(), SendError<bool>> {
+    pub fn stop(&self) -> Result<(), SendError<bool>> {
         self.stop_tx.send(false)?;
         Ok(())
     }
@@ -142,31 +143,28 @@ impl AudioCaptureApi {
         let audio_client = unsafe { device.Activate::<IAudioClient>(CLSCTX_ALL, None) }
             .expect("couldn't activate audio device");
 
-        // Get format directly from audio client
+        // get format from audio client
         let format_ptr = unsafe { audio_client.GetMixFormat().unwrap() };
-        let wave_format = unsafe { format_ptr.as_ref().expect("Null format pointer") };
+        let wave_format = unsafe { format_ptr.as_ref().expect("null format pointer") };
 
-        // Check format details
+        // check format details
         let sample_rate = wave_format.nSamplesPerSec;
         let channels = wave_format.nChannels;
         println!(
-            "[Audio] Channels: {}, Sample Rate: {}",
+            "[audio] Channels: {}, Sample Rate: {}",
             channels, sample_rate
         );
 
         self.inner.lock().unwrap().channels = Some(channels);
 
-        // Validate format type
+        // check if float audio format
         let is_float = match wave_format.wFormatTag {
-            wave_format_ieee_float => true,
-            wave_format_extensible => {
-                // Cast to WAVEFORMATEXTENSIBLE and read unaligned
+            3 => true,
+            65534 => {
                 let wave_format_ext_ptr =
                     unsafe { format_ptr.cast::<WAVEFORMATEXTENSIBLE>().as_ref() }.unwrap();
 
-                // SAFETY: We know the pointer is valid and we're using read_unaligned
                 let sub_format = unsafe {
-                    // Get pointer to SubFormat field without creating a reference
                     let sub_format_ptr = std::ptr::addr_of!((*wave_format_ext_ptr).SubFormat);
                     std::ptr::read_unaligned(sub_format_ptr)
                 };
@@ -177,7 +175,7 @@ impl AudioCaptureApi {
         };
 
         if !is_float {
-            panic!("Unsupported audio format - expected IEEE Float");
+            panic!("unsupported audio format!");
         }
 
         unsafe {
