@@ -37,4 +37,14 @@ features = [
 	"Win32_System_WinRT_Direct3D11",
 	"Win32_Graphics_Dxgi",
 	"Win32_Graphics_Dxgi_Common",
+
+	# mux
+	"Media_MediaProperties",
+	"Media_Transcoding",
+	"Media_Core",
+	"Storage_Streams",
+	"Storage",
+	"Storage_FileProperties",
+	"Security_Cryptography",
+	"Storage_Search"
 ]

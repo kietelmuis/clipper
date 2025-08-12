@@ -1,11 +1,12 @@
 use rusty_ffmpeg::ffi::{
     self as ffmpeg, AV_CHANNEL_ORDER_UNSPEC, AV_CODEC_ID_AAC, AV_CODEC_ID_H264, AV_CODEC_ID_HEVC,
-    AV_PIX_FMT_YUV420P, AV_SAMPLE_FMT_FLT, AV_SAMPLE_FMT_FLTP, AV_SAMPLE_FMT_U8, AVChannelLayout,
-    AVChannelLayout__bindgen_ty_1, AVCodec, AVCodecContext, AVCodecID, AVFormatContext, AVFrame,
-    AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_VIDEO, AVPacket, AVRational, AVSampleFormat, AVStream,
-    SwrContext, SwsContext, av_channel_layout_copy, av_channel_layout_default, av_frame_copy,
-    av_frame_get_buffer, av_packet_alloc, avcodec_alloc_context3, avcodec_parameters_from_context,
-    avformat_new_stream, swr_alloc, swr_get_out_samples,
+    AV_PIX_FMT_YUV420P, AV_ROUND_NEAR_INF, AV_ROUND_PASS_MINMAX, AV_SAMPLE_FMT_FLT,
+    AV_SAMPLE_FMT_FLTP, AV_SAMPLE_FMT_U8, AVChannelLayout, AVChannelLayout__bindgen_ty_1, AVCodec,
+    AVCodecContext, AVCodecID, AVFormatContext, AVFrame, AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_VIDEO,
+    AVPacket, AVRational, AVSampleFormat, AVStream, SwrContext, SwsContext, av_channel_layout_copy,
+    av_channel_layout_default, av_frame_copy, av_frame_get_buffer, av_packet_alloc,
+    avcodec_alloc_context3, avcodec_parameters_from_context, avformat_new_stream, swr_alloc,
+    swr_get_out_samples,
 };
 
 use crossbeam::channel::{self, SendError};
@@ -76,6 +77,7 @@ impl CaptureMuxer {
     }
 
     pub fn init(&mut self) {
+        println!("[muxer] initing ffmpeg");
         // init all yo shi
         unsafe { ffmpeg::avdevice_register_all() };
 
@@ -105,6 +107,7 @@ impl CaptureMuxer {
         let mut format_context: *mut AVFormatContext = std::ptr::null_mut();
         let file_name = CString::new("video.mp4").expect("cstring fail");
 
+        println!("[muxer] creating output format context for video.mp4 and opening file");
         if unsafe {
             ffmpeg::avformat_alloc_output_context2(
                 &mut format_context,
@@ -132,6 +135,7 @@ impl CaptureMuxer {
         self.format_context = NonNull::new(format_context);
 
         // create video and audio muxstreams
+        println!("[muxer] Creating video stream");
         self.video_stream = Some(self.create_video_muxstream(
             format_context,
             video_format,
@@ -147,6 +151,7 @@ impl CaptureMuxer {
             audio_timebase,
         ));
 
+        println!("[muxer] starting encode frames process");
         self.encode_frames(
             format_context,
             sample_format_in,
@@ -276,31 +281,19 @@ impl CaptureMuxer {
         }
     }
 
-    fn process_video_frame(&mut self, video_buffer: VideoBuffer) {
+    fn process_video_frame(&mut self, video_buffer: VideoBuffer, frame_index: i64) {
         // create empty yuv avframe
         let mut yuv_frame = unsafe { ffmpeg::av_frame_alloc() };
         if yuv_frame.is_null() {
             panic!("Failed to allocate AVFrame!");
         }
 
-        let timebase = (*unsafe { self.video_stream.as_ref().unwrap().encoder.as_ref() }).time_base;
-        let pts = unsafe {
-            ffmpeg::av_rescale_q(
-                video_buffer.timestamp.as_micros() as i64,
-                AVRational {
-                    num: 1,
-                    den: 1_000_000,
-                },
-                timebase,
-            )
-        };
-
         // fill required base avframe data
         unsafe {
             (*yuv_frame).format = ffmpeg::AV_PIX_FMT_YUV420P;
             (*yuv_frame).width = 1920;
             (*yuv_frame).height = 1080;
-            (*yuv_frame).pts = pts;
+            (*yuv_frame).pts = frame_index;
         };
 
         // free if failed to allocate buffer data
@@ -348,6 +341,7 @@ impl CaptureMuxer {
         sample_format_out: AVSampleFormat,
         sample_rate: i32,
         audio_buffer: AudioBuffer,
+        frame_index: i64,
     ) {
         // allocate output frame
         let output_frame = unsafe { ffmpeg::av_frame_alloc() };
@@ -362,6 +356,8 @@ impl CaptureMuxer {
                 .nb_channels
         }
         .clone();
+
+        // i dunno ur cooked ig
         assert_eq!(
             total_bytes % channels,
             0,
@@ -369,9 +365,11 @@ impl CaptureMuxer {
             total_bytes,
             channels
         );
+
         let sample_amount = (total_bytes / channels) as i32;
 
-        let max_out = unsafe {
+        // get the max samples in the audiobuffer to avoid nan error
+        let out_samples = unsafe {
             swr_get_out_samples(
                 self.audio_stream
                     .as_mut()
@@ -384,18 +382,6 @@ impl CaptureMuxer {
             )
         } as i32;
 
-        let timebase = (*unsafe { self.audio_stream.as_ref().unwrap().encoder.as_ref() }).time_base;
-        let pts = unsafe {
-            ffmpeg::av_rescale_q(
-                audio_buffer.time.as_micros() as i64,
-                AVRational {
-                    num: 1,
-                    den: 1_000_000,
-                },
-                timebase,
-            )
-        };
-
         // set its options
         unsafe {
             av_channel_layout_copy(
@@ -404,8 +390,8 @@ impl CaptureMuxer {
             );
             (*output_frame).format = sample_format_out;
             (*output_frame).sample_rate = sample_rate;
-            (*output_frame).nb_samples = max_out;
-            (*output_frame).pts = pts;
+            (*output_frame).nb_samples = out_samples;
+            (*output_frame).pts = frame_index;
         }
 
         // allocate output buffer
@@ -428,7 +414,7 @@ impl CaptureMuxer {
             (*input_frame).format = sample_format_in;
             (*input_frame).sample_rate = sample_rate;
             (*input_frame).nb_samples = sample_amount;
-            (*input_frame).pts = pts;
+            (*input_frame).pts = frame_index;
         };
 
         // allocate input buffer
@@ -542,6 +528,7 @@ impl CaptureMuxer {
         self.create_swr(sample_format_in, sample_format_out, sample_rate);
 
         // write header for video
+        println!("[encoder] writing video header");
         if unsafe { ffmpeg::avformat_write_header(format_context, std::ptr::null_mut()) } < 0 {
             panic!("failed to write header");
         }
@@ -551,6 +538,9 @@ impl CaptureMuxer {
         // different from internal instant
         let mut last_print = std::time::Instant::now();
         let print_interval = std::time::Duration::from_secs(1);
+
+        let mut frame_index: i64 = 0;
+        let mut frames_processed = 0;
 
         // attempt to get video frames
         loop {
@@ -565,16 +555,17 @@ impl CaptureMuxer {
 
             // Print status every second
             if last_print.elapsed() >= print_interval {
-                println!("[encoder] recording for {}s", seconds_elapsed);
+                println!(
+                    "[encoder] Recording for {}s, processed {} frames",
+                    seconds_elapsed, frames_processed
+                );
                 last_print = std::time::Instant::now();
             }
 
-            // Receive frames without timeout - blocking is acceptable
             let video_buffer = match self.video_api.video_rx.recv() {
                 Ok(buf) => buf,
                 Err(_) => {
-                    // Handle disconnection
-                    eprintln!("Video channel disconnected");
+                    eprintln!("[encoder] Video channel disconnected");
                     break;
                 }
             };
@@ -582,7 +573,6 @@ impl CaptureMuxer {
             let audio_buffer = match self.audio_api.audio_rx.recv() {
                 Ok(buf) => buf,
                 Err(_) => {
-                    // Handle disconnection
                     eprintln!("Audio channel disconnected");
                     break;
                 }
@@ -594,21 +584,29 @@ impl CaptureMuxer {
                 sample_format_out,
                 sample_rate,
                 audio_buffer,
+                frame_index,
             );
-            self.process_video_frame(video_buffer);
+            self.process_video_frame(video_buffer, frame_index);
+
+            frame_index += 1;
+            frames_processed += 1;
         }
 
+        println!(
+            "[encoder] stopping recording after processing {} frames",
+            frames_processed
+        );
         self.stop_recording();
 
-        println!("[encoder] attempting to write");
+        println!("[encoder] writing video data");
         unsafe {
             if format_context.is_null() {
-                panic!("output is null");
+                panic!("output format context is null");
             }
 
             // try to write to internal io
-            if ffmpeg::av_write_trailer(format_context) > 0 {
-                panic!("epic fail");
+            if ffmpeg::av_write_trailer(format_context) < 0 {
+                panic!("failed to write trailer");
             };
 
             // close the internal io context inside output
@@ -616,7 +614,7 @@ impl CaptureMuxer {
 
             // free the encoders
             ffmpeg::avcodec_free_context(&mut self.video_stream.as_mut().unwrap().encoder.as_ptr());
-            ffmpeg::avcodec_free_context(&mut self.audio_stream.as_mut().unwrap().encoder.as_ptr());
+            // ffmpeg::avcodec_free_context(&mut self.audio_stream.as_mut().unwrap().encoder.as_ptr());
 
             // free its streams
             ffmpeg::avformat_free_context(format_context);
@@ -631,7 +629,7 @@ impl CaptureMuxer {
                     .as_ptr(),
             );
         }
-        println!("encoder: success!");
+        println!("[encoder] success!");
     }
 
     fn write_frame(&mut self, frame: *mut AVFrame) {
@@ -646,7 +644,7 @@ impl CaptureMuxer {
 
         let mut ret = unsafe { ffmpeg::avcodec_send_frame(encoder, frame) };
         if ret < 0 {
-            panic!("dang")
+            panic!("Failed to send frame to encoder: {}", ret);
         }
 
         while ret >= 0 {
@@ -654,7 +652,7 @@ impl CaptureMuxer {
             if ret == ffmpeg::AVERROR(ffmpeg::EAGAIN) || ret == ffmpeg::AVERROR_EOF {
                 break;
             } else if ret < 0 {
-                panic!("fuck");
+                panic!("Failed to receive packet from encoder: {}", ret);
             }
 
             unsafe {
@@ -663,7 +661,7 @@ impl CaptureMuxer {
             };
 
             if unsafe { ffmpeg::av_interleaved_write_frame(format_context, packet) } < 0 {
-                panic!("write fail");
+                panic!("Failed to write frame to output file");
             }
 
             unsafe { ffmpeg::av_packet_unref(packet) };
