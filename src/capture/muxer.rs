@@ -242,7 +242,7 @@ impl CaptureMuxer {
         (*encoder_ptr).height = 1080;
         (*encoder_ptr).pix_fmt = pixel_format;
         (*encoder_ptr).time_base = timebase;
-        (*encoder_ptr).bit_rate = 9_000_000;
+        (*encoder_ptr).bit_rate = 5_000_000;
         (*encoder_ptr).codec_id = codec_id;
         (*encoder_ptr).codec_type = AVMEDIA_TYPE_VIDEO;
 
@@ -271,31 +271,19 @@ impl CaptureMuxer {
         }
     }
 
-    fn process_video_frame(&mut self, video_buffer: VideoBuffer) {
+    fn process_video_frame(&mut self, video_buffer: VideoBuffer, frame_index: i64) {
         // create empty yuv avframe
         let mut yuv_frame = unsafe { ffmpeg::av_frame_alloc() };
         if yuv_frame.is_null() {
             panic!("Failed to allocate AVFrame!");
         }
 
-        let timebase = (*unsafe { self.video_stream.as_ref().unwrap().encoder.as_ref() }).time_base;
-        let pts = unsafe {
-            ffmpeg::av_rescale_q(
-                video_buffer.timestamp.as_micros() as i64,
-                AVRational {
-                    num: 1,
-                    den: 1_000_000,
-                },
-                timebase,
-            )
-        };
-
         // fill required base avframe data
         unsafe {
             (*yuv_frame).format = ffmpeg::AV_PIX_FMT_YUV420P;
             (*yuv_frame).width = 1920;
             (*yuv_frame).height = 1080;
-            (*yuv_frame).pts = pts;
+            (*yuv_frame).pts = frame_index;
         };
 
         // free if failed to allocate buffer data
@@ -343,6 +331,7 @@ impl CaptureMuxer {
         sample_format_out: AVSampleFormat,
         sample_rate: i32,
         audio_buffer: AudioBuffer,
+        frame_index: i64,
     ) {
         // allocate output frame
         let output_frame = unsafe { ffmpeg::av_frame_alloc() };
@@ -379,18 +368,6 @@ impl CaptureMuxer {
             )
         } as i32;
 
-        let timebase = (*unsafe { self.audio_stream.as_ref().unwrap().encoder.as_ref() }).time_base;
-        let pts = unsafe {
-            ffmpeg::av_rescale_q(
-                audio_buffer.time.as_micros() as i64,
-                AVRational {
-                    num: 1,
-                    den: 1_000_000,
-                },
-                timebase,
-            )
-        };
-
         // set its options
         unsafe {
             av_channel_layout_copy(
@@ -400,7 +377,7 @@ impl CaptureMuxer {
             (*output_frame).format = sample_format_out;
             (*output_frame).sample_rate = sample_rate;
             (*output_frame).nb_samples = max_out;
-            (*output_frame).pts = pts;
+            (*output_frame).pts = frame_index;
         }
 
         // allocate output buffer
@@ -423,7 +400,7 @@ impl CaptureMuxer {
             (*input_frame).format = sample_format_in;
             (*input_frame).sample_rate = sample_rate;
             (*input_frame).nb_samples = sample_amount;
-            (*input_frame).pts = pts;
+            (*input_frame).pts = frame_index;
         };
 
         // allocate input buffer
@@ -547,6 +524,8 @@ impl CaptureMuxer {
         let mut last_print = std::time::Instant::now();
         let print_interval = std::time::Duration::from_secs(1);
 
+        let mut frame_index = 1;
+
         // attempt to get video frames
         loop {
             let elapsed = start_time.elapsed();
@@ -589,8 +568,11 @@ impl CaptureMuxer {
                 sample_format_out,
                 sample_rate,
                 audio_buffer,
+                frame_index,
             );
-            self.process_video_frame(video_buffer);
+            self.process_video_frame(video_buffer, frame_index);
+
+            frame_index += 1;
         }
 
         self.stop_recording();
