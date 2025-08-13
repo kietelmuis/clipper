@@ -275,6 +275,26 @@ impl CaptureMuxer {
     }
 
     fn process_video_frame(&mut self, video_buffer: VideoBuffer, frame_index: i64) {
+        // Ensure SWS context exists with correct source/dest sizes
+        if self
+            .video_stream
+            .as_ref()
+            .and_then(|s| s.sws_context)
+            .is_none()
+        {
+            // Destination size comes from the encoder settings
+            let (dst_w, dst_h) = unsafe {
+                let enc = self.video_stream.as_ref().unwrap().encoder.as_ref();
+                ((*enc).width, (*enc).height)
+            };
+            self.create_sws(
+                video_buffer.width as i32,
+                video_buffer.height as i32,
+                dst_w,
+                dst_h,
+            );
+        }
+
         // create empty yuv avframe
         let mut yuv_frame = unsafe { ffmpeg::av_frame_alloc() };
         if yuv_frame.is_null() {
@@ -284,8 +304,10 @@ impl CaptureMuxer {
         // fill required base avframe data
         unsafe {
             (*yuv_frame).format = ffmpeg::AV_PIX_FMT_YUV420P;
-            (*yuv_frame).width = 1920;
-            (*yuv_frame).height = 1080;
+            // Destination size comes from encoder
+            let enc = self.video_stream.as_ref().unwrap().encoder.as_ref();
+            (*yuv_frame).width = (*enc).width;
+            (*yuv_frame).height = (*enc).height;
             (*yuv_frame).pts = frame_index;
         };
 
@@ -297,7 +319,7 @@ impl CaptureMuxer {
             panic!("could not allocate frame buffer!");
         }
 
-        // converting a bgraframe into a yuvframe
+    // converting a BGRA frame into a YUV frame
         if unsafe {
             ffmpeg::sws_scale(
                 self.video_stream
@@ -306,10 +328,11 @@ impl CaptureMuxer {
                     .sws_context
                     .unwrap()
                     .as_ptr(),
-                [video_buffer.bgra.as_ptr()].as_ptr(),
-                [1920 * 4].as_ptr(),
+        [video_buffer.bgra.as_ptr()].as_ptr(),
+        // Stride (bytes per line) of source BGRA buffer
+        [(video_buffer.width * 4) as i32].as_ptr(),
                 0,
-                1080,
+        video_buffer.height as i32,
                 (*yuv_frame).data.as_mut_ptr(),
                 (*yuv_frame).linesize.as_mut_ptr(),
             )
@@ -438,14 +461,14 @@ impl CaptureMuxer {
         self.write_audio(output_frame);
     }
 
-    fn create_sws(&mut self) {
+    fn create_sws(&mut self, src_w: i32, src_h: i32, dst_w: i32, dst_h: i32) {
         let sws_context = NonNull::new(unsafe {
             ffmpeg::sws_getContext(
-                1920,
-                1080,
+                src_w,
+                src_h,
                 ffmpeg::AV_PIX_FMT_BGRA,
-                1920,
-                1080,
+                dst_w,
+                dst_h,
                 ffmpeg::AV_PIX_FMT_YUV420P,
                 0,
                 std::ptr::null_mut(),
@@ -512,8 +535,7 @@ impl CaptureMuxer {
         sample_format_out: AVSampleFormat,
         sample_rate: i32,
     ) {
-        // init sws context
-        self.create_sws();
+    // SWS context will be lazily created on first video frame using actual source dimensions
         self.create_swr(sample_format_in, sample_format_out, sample_rate);
 
         // write header for video
@@ -626,7 +648,7 @@ impl CaptureMuxer {
         self.stop_recording();
 
         println!("[encoder] attempting to write");
-        unsafe {
+    unsafe {
             if format_context.is_null() {
                 panic!("output is null");
             }
@@ -639,22 +661,33 @@ impl CaptureMuxer {
             // close the internal io context inside output
             ffmpeg::avio_close((*format_context).pb);
 
-            // free the encoders
-            ffmpeg::avcodec_free_context(&mut self.video_stream.as_mut().unwrap().encoder.as_ptr());
-            ffmpeg::avcodec_free_context(&mut self.audio_stream.as_mut().unwrap().encoder.as_ptr());
+            // free the encoders (pass pointers by mutable reference as required)
+            let mut venc = self.video_stream.as_mut().unwrap().encoder.as_ptr();
+            ffmpeg::avcodec_free_context(&mut venc);
+            let mut aenc = self.audio_stream.as_mut().unwrap().encoder.as_ptr();
+            ffmpeg::avcodec_free_context(&mut aenc);
 
             // free its streams
             ffmpeg::avformat_free_context(format_context);
 
-            // free the converter context
-            ffmpeg::sws_freeContext(
-                self.video_stream
-                    .as_ref()
-                    .unwrap()
-                    .sws_context
-                    .unwrap()
-                    .as_ptr(),
-            );
+            // free the converter contexts if they exist
+            if let Some(sws) = self
+                .video_stream
+                .as_ref()
+                .unwrap()
+                .sws_context
+            {
+                ffmpeg::sws_freeContext(sws.as_ptr());
+            }
+            if let Some(swr) = self
+                .audio_stream
+                .as_ref()
+                .unwrap()
+                .swr_context
+            {
+                let mut swr_ptr = swr.as_ptr();
+                ffmpeg::swr_free(&mut swr_ptr);
+            }
         }
         println!("encoder: success!");
     }
