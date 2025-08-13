@@ -7,7 +7,7 @@ use rusty_ffmpeg::ffi::{
     avcodec_parameters_from_context, avformat_new_stream, swr_get_out_samples,
 };
 
-use std::{collections::VecDeque, ffi::CString, ptr::NonNull, sync::Arc, time::Instant};
+use std::{ffi::CString, ptr::NonNull, sync::Arc, time::Instant};
 
 use crate::capture::{
     audio::{AudioBuffer, AudioCaptureApi},
@@ -40,6 +40,9 @@ pub struct CaptureMuxer {
     format_context: Option<NonNull<AVFormatContext>>,
 
     instant: Arc<Instant>,
+
+    // Buffer for audio samples to ensure 1024-sample frames
+    audio_sample_buffer: Vec<f32>,
 }
 
 impl CaptureMuxer {
@@ -57,6 +60,7 @@ impl CaptureMuxer {
             audio_stream: None,
             video_stream: None,
             format_context: None,
+            audio_sample_buffer: Vec::new(),
         }
     }
 
@@ -526,6 +530,7 @@ impl CaptureMuxer {
         let mut frame_index = 1;
 
         // attempt to get video frames
+        const AAC_FRAME_SIZE: usize = 1024;
         loop {
             let elapsed = start_time.elapsed();
             let seconds_elapsed = elapsed.as_secs();
@@ -561,17 +566,61 @@ impl CaptureMuxer {
                 }
             };
 
-            // process av
+            // Buffer incoming audio samples
+            self.audio_sample_buffer.extend_from_slice(&audio_buffer.buffer);
+
+            // Process full AAC frames
+            let channels = unsafe {
+                &(*self.audio_stream.as_ref().unwrap().encoder.as_ptr())
+                    .ch_layout
+                    .nb_channels
+            };
+            let frame_samples = AAC_FRAME_SIZE * (*channels as usize);
+            let mut processed = 0;
+            while self.audio_sample_buffer.len() - processed >= frame_samples {
+                let frame_data = self.audio_sample_buffer[processed..processed + frame_samples].to_vec();
+                let audio_frame = AudioBuffer {
+                    buffer: frame_data,
+                    time: audio_buffer.time, // time is not critical for encoding
+                };
+                self.process_audio_frame(
+                    sample_format_in,
+                    sample_format_out,
+                    sample_rate,
+                    audio_frame,
+                    frame_index,
+                );
+                frame_index += 1;
+                processed += frame_samples;
+            }
+            // Remove processed samples
+            if processed > 0 {
+                self.audio_sample_buffer.drain(0..processed);
+            }
+
+            self.process_video_frame(video_buffer, frame_index);
+        }
+
+        // After loop, flush any remaining samples (last frame)
+        if !self.audio_sample_buffer.is_empty() {
+            let channels = unsafe {
+                &(*self.audio_stream.as_ref().unwrap().encoder.as_ptr())
+                    .ch_layout
+                    .nb_channels
+            };
+            let frame_data = self.audio_sample_buffer.clone();
+            let audio_frame = AudioBuffer {
+                buffer: frame_data,
+                time: std::time::Duration::ZERO,
+            };
             self.process_audio_frame(
                 sample_format_in,
                 sample_format_out,
                 sample_rate,
-                audio_buffer,
+                audio_frame,
                 frame_index,
             );
-            self.process_video_frame(video_buffer, frame_index);
-
-            frame_index += 1;
+            self.audio_sample_buffer.clear();
         }
 
         self.stop_recording();

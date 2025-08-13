@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use crossbeam::channel::{self, Receiver, Sender, SendError};
 use std::f32::consts::PI;
