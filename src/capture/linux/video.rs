@@ -37,11 +37,13 @@ impl VideoCaptureApi {
         let callback = Arc::new(video_tx);
         let instant_clone = instant.clone();
         let callback_clone = callback.clone();
-        // Spawn thread to send dummy video data (always running)
+        // Spawn thread to send dummy video data (always running) at ~30 fps
         std::thread::spawn(move || {
             let width = 640;
             let height = 480;
             let mut color: u8 = 0;
+            let frame_duration = Duration::from_nanos(1_000_000_000u64 / 30);
+            let mut next = std::time::Instant::now();
             loop {
                 let mut bgra = vec![0u8; (width * height * 4) as usize];
                 for i in 0..(width * height) {
@@ -58,8 +60,15 @@ impl VideoCaptureApi {
                     timestamp: instant_clone.elapsed(),
                 };
                 let _ = callback_clone.send(buffer);
-                color = color.wrapping_add(16);
-                std::thread::sleep(Duration::from_secs(1));
+                color = color.wrapping_add(8);
+                next += frame_duration;
+                let now = std::time::Instant::now();
+                if next > now {
+                    std::thread::sleep(next - now);
+                } else {
+                    // If we're behind, skip to now to avoid drift build-up
+                    next = now;
+                }
             }
         });
         Self {
@@ -83,6 +92,8 @@ impl VideoCaptureApi {
             let width = 640;
             let height = 480;
             let mut color: u8 = 0;
+            let frame_duration = Duration::from_nanos(1_000_000_000u64 / 30);
+            let mut next = std::time::Instant::now();
             while running.load(std::sync::atomic::Ordering::SeqCst) {
                 let mut bgra = vec![0u8; (width * height * 4) as usize];
                 for i in 0..(width * height) {
@@ -99,8 +110,14 @@ impl VideoCaptureApi {
                     timestamp: instant.elapsed(),
                 };
                 let _ = callback.send(buffer);
-                color = color.wrapping_add(16);
-                thread::sleep(Duration::from_secs(1));
+                color = color.wrapping_add(8);
+                next += frame_duration;
+                let now = std::time::Instant::now();
+                if next > now {
+                    std::thread::sleep(next - now);
+                } else {
+                    next = now;
+                }
             }
         }));
         Ok(())

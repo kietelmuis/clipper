@@ -43,6 +43,10 @@ pub struct CaptureMuxer {
 
     // Buffer for audio samples to ensure 1024-sample frames
     audio_sample_buffer: Vec<f32>,
+
+    // PTS counters
+    video_pts: i64,
+    audio_pts: i64,
 }
 
 impl CaptureMuxer {
@@ -61,6 +65,8 @@ impl CaptureMuxer {
             video_stream: None,
             format_context: None,
             audio_sample_buffer: Vec::new(),
+            video_pts: 0,
+            audio_pts: 0,
         }
     }
 
@@ -172,7 +178,7 @@ impl CaptureMuxer {
         let mut encoder = NonNull::new(unsafe { avcodec_alloc_context3(codec) })
             .expect("failed to create encoder");
 
-        // make a boilerplate channel layout to apply defualt later
+    // make a boilerplate channel layout to apply default later
         let mut channel_layout = AVChannelLayout {
             order: AV_CHANNEL_ORDER_UNSPEC,
             nb_channels: 0,
@@ -185,7 +191,8 @@ impl CaptureMuxer {
 
         // set default layout and adjust settings
         unsafe {
-            av_channel_layout_default(&mut channel_layout, 2);
+            // Match dummy audio source (mono). Adjust here when capturing real device channels.
+            av_channel_layout_default(&mut channel_layout, 1);
             (*encoder_ptr).ch_layout = channel_layout;
             (*encoder_ptr).sample_fmt = sample_format;
             (*encoder_ptr).sample_rate = sample_rate;
@@ -209,6 +216,11 @@ impl CaptureMuxer {
             < 0
         {
             panic!("could not set encoder parameters");
+        }
+
+        // Ensure stream time_base matches encoder time_base for correct PTS scaling
+        unsafe {
+            (*stream.as_mut()).time_base = (*encoder_ptr).time_base;
         }
 
         MuxStream {
@@ -266,6 +278,11 @@ impl CaptureMuxer {
             panic!("could not set encoder parameters");
         }
 
+        // Ensure stream time_base matches encoder time_base for correct PTS scaling
+        unsafe {
+            (*stream.as_mut()).time_base = (*encoder_ptr).time_base;
+        }
+
         MuxStream {
             stream,
             encoder,
@@ -274,7 +291,7 @@ impl CaptureMuxer {
         }
     }
 
-    fn process_video_frame(&mut self, video_buffer: VideoBuffer, frame_index: i64) {
+    fn process_video_frame(&mut self, video_buffer: VideoBuffer, _frame_index: i64) {
         // Ensure SWS context exists with correct source/dest sizes
         if self
             .video_stream
@@ -308,7 +325,11 @@ impl CaptureMuxer {
             let enc = self.video_stream.as_ref().unwrap().encoder.as_ref();
             (*yuv_frame).width = (*enc).width;
             (*yuv_frame).height = (*enc).height;
-            (*yuv_frame).pts = frame_index;
+            // Compute PTS from source timestamp and encoder time_base
+            let tb = (*enc).time_base;
+            let ts_sec = video_buffer.timestamp.as_secs_f64();
+            let pts = (ts_sec * (tb.den as f64) / (tb.num as f64)).round() as i64;
+            (*yuv_frame).pts = pts;
         };
 
         // free if failed to allocate buffer data
@@ -357,7 +378,6 @@ impl CaptureMuxer {
         sample_format_out: AVSampleFormat,
         sample_rate: i32,
         audio_buffer: AudioBuffer,
-        frame_index: i64,
     ) {
         // allocate output frame
         let output_frame = unsafe { ffmpeg::av_frame_alloc() };
@@ -403,7 +423,8 @@ impl CaptureMuxer {
             (*output_frame).format = sample_format_out;
             (*output_frame).sample_rate = sample_rate;
             (*output_frame).nb_samples = max_out;
-            (*output_frame).pts = frame_index;
+            // Set PTS in units of audio time_base (samples)
+            (*output_frame).pts = self.audio_pts;
         }
 
         // allocate output buffer
@@ -426,7 +447,7 @@ impl CaptureMuxer {
             (*input_frame).format = sample_format_in;
             (*input_frame).sample_rate = sample_rate;
             (*input_frame).nb_samples = sample_amount;
-            (*input_frame).pts = frame_index;
+            (*input_frame).pts = self.audio_pts;
         };
 
         // allocate input buffer
@@ -458,7 +479,10 @@ impl CaptureMuxer {
             panic!("fuck");
         }
 
-        self.write_audio(output_frame);
+    // After conversion, nb_samples is the actual output size; advance PTS
+    let converted_samples = unsafe { (*output_frame).nb_samples } as i64;
+    self.write_audio(output_frame);
+    self.audio_pts += converted_samples;
     }
 
     fn create_sws(&mut self, src_w: i32, src_h: i32, dst_w: i32, dst_h: i32) {
@@ -536,7 +560,7 @@ impl CaptureMuxer {
         sample_rate: i32,
     ) {
     // SWS context will be lazily created on first video frame using actual source dimensions
-        self.create_swr(sample_format_in, sample_format_out, sample_rate);
+    self.create_swr(sample_format_in, sample_format_out, sample_rate);
 
         // write header for video
         if unsafe { ffmpeg::avformat_write_header(format_context, std::ptr::null_mut()) } < 0 {
@@ -549,7 +573,9 @@ impl CaptureMuxer {
         let mut last_print = std::time::Instant::now();
         let print_interval = std::time::Duration::from_secs(1);
 
-        let mut frame_index = 1;
+    // Reset pts counters
+    self.video_pts = 0;
+    self.audio_pts = 0;
 
         // attempt to get video frames
         const AAC_FRAME_SIZE: usize = 1024;
@@ -610,9 +636,7 @@ impl CaptureMuxer {
                     sample_format_out,
                     sample_rate,
                     audio_frame,
-                    frame_index,
                 );
-                frame_index += 1;
                 processed += frame_samples;
             }
             // Remove processed samples
@@ -620,16 +644,12 @@ impl CaptureMuxer {
                 self.audio_sample_buffer.drain(0..processed);
             }
 
-            self.process_video_frame(video_buffer, frame_index);
+            self.process_video_frame(video_buffer, self.video_pts);
+            self.video_pts += 1;
         }
 
         // After loop, flush any remaining samples (last frame)
         if !self.audio_sample_buffer.is_empty() {
-            let channels = unsafe {
-                &(*self.audio_stream.as_ref().unwrap().encoder.as_ptr())
-                    .ch_layout
-                    .nb_channels
-            };
             let frame_data = self.audio_sample_buffer.clone();
             let audio_frame = AudioBuffer {
                 buffer: frame_data,
@@ -640,7 +660,6 @@ impl CaptureMuxer {
                 sample_format_out,
                 sample_rate,
                 audio_frame,
-                frame_index,
             );
             self.audio_sample_buffer.clear();
         }
@@ -648,10 +667,14 @@ impl CaptureMuxer {
         self.stop_recording();
 
         println!("[encoder] attempting to write");
-    unsafe {
+        unsafe {
             if format_context.is_null() {
                 panic!("output is null");
             }
+
+            // Flush encoders: drain delayed packets
+            self.flush_video_encoder();
+            self.flush_audio_encoder();
 
             // try to write to internal io
             if ffmpeg::av_write_trailer(format_context) > 0 {
@@ -690,6 +713,111 @@ impl CaptureMuxer {
             }
         }
         println!("encoder: success!");
+    }
+
+    fn flush_video_encoder(&mut self) {
+        unsafe {
+            let encoder = self.video_stream.as_mut().unwrap().encoder.as_mut();
+            let stream = self.video_stream.as_mut().unwrap().stream.as_ref();
+            let format_context = self.format_context.unwrap().as_mut();
+
+            // Send null frame to signal EOF
+            let mut ret = ffmpeg::avcodec_send_frame(encoder, std::ptr::null_mut());
+            if ret < 0 && ret != ffmpeg::AVERROR_EOF {
+                return;
+            }
+            let mut packet = ffmpeg::av_packet_alloc();
+            if packet.is_null() {
+                return;
+            }
+            loop {
+                ret = ffmpeg::avcodec_receive_packet(encoder, packet);
+                if ret == ffmpeg::AVERROR(ffmpeg::EAGAIN) || ret == ffmpeg::AVERROR_EOF {
+                    break;
+                } else if ret < 0 {
+                    break;
+                }
+                ffmpeg::av_packet_rescale_ts(packet, (*encoder).time_base, (*stream).time_base);
+                (*packet).stream_index = (*stream).index;
+                if ffmpeg::av_interleaved_write_frame(format_context, packet) < 0 {
+                    break;
+                }
+                ffmpeg::av_packet_unref(packet);
+            }
+            ffmpeg::av_packet_free(&mut packet);
+        }
+    }
+
+    fn flush_audio_encoder(&mut self) {
+        unsafe {
+            let encoder = self.audio_stream.as_mut().unwrap().encoder.as_mut();
+            let stream = self.audio_stream.as_mut().unwrap().stream.as_ref();
+            let format_context = self.format_context.unwrap().as_mut();
+
+            // Drain resampler first
+            if let Some(mut swr) = self.audio_stream.as_ref().unwrap().swr_context {
+                // Create an output frame for draining
+                let out = ffmpeg::av_frame_alloc();
+                if !out.is_null() {
+                    av_channel_layout_copy(&mut (*out).ch_layout, &(*encoder).ch_layout);
+                    (*out).format = (*encoder).sample_fmt;
+                    (*out).sample_rate = (*encoder).sample_rate;
+                    (*out).nb_samples = 0; // let swr decide
+                    (*out).pts = self.audio_pts;
+                    let _ = ffmpeg::swr_convert_frame(swr.as_mut(), out, std::ptr::null_mut());
+                    if (*out).nb_samples > 0 {
+                        // Advance pts by drained samples
+                        self.audio_pts += (*out).nb_samples as i64;
+                        // send drained audio
+                        let mut pkt = ffmpeg::av_packet_alloc();
+                        if !pkt.is_null() {
+                            let mut ret = ffmpeg::avcodec_send_frame(encoder, out);
+                            while ret >= 0 {
+                                ret = ffmpeg::avcodec_receive_packet(encoder, pkt);
+                                if ret == ffmpeg::AVERROR(ffmpeg::EAGAIN) || ret == ffmpeg::AVERROR_EOF {
+                                    break;
+                                } else if ret < 0 {
+                                    break;
+                                }
+                                ffmpeg::av_packet_rescale_ts(pkt, (*encoder).time_base, (*stream).time_base);
+                                (*pkt).stream_index = (*stream).index;
+                                if ffmpeg::av_interleaved_write_frame(format_context, pkt) < 0 {
+                                    break;
+                                }
+                                ffmpeg::av_packet_unref(pkt);
+                            }
+                            ffmpeg::av_packet_free(&mut pkt);
+                        }
+                    }
+                    ffmpeg::av_frame_free(&mut (out as *mut AVFrame));
+                }
+            }
+
+            // Then flush the encoder
+            let mut ret = ffmpeg::avcodec_send_frame(encoder, std::ptr::null_mut());
+            if ret < 0 && ret != ffmpeg::AVERROR_EOF {
+                return;
+            }
+            let mut packet = ffmpeg::av_packet_alloc();
+            if packet.is_null() {
+                return;
+            }
+            loop {
+                ret = ffmpeg::avcodec_receive_packet(encoder, packet);
+                if ret == ffmpeg::AVERROR(ffmpeg::EAGAIN) || ret == ffmpeg::AVERROR_EOF {
+                    break;
+                } else if ret < 0 {
+                    break;
+                }
+                ffmpeg::av_packet_rescale_ts(packet, (*encoder).time_base, (*stream).time_base);
+                (*packet).stream_index = (*stream).index;
+                if ffmpeg::av_interleaved_write_frame(format_context, packet) < 0 {
+                    break;
+                }
+                ffmpeg::av_packet_unref(packet);
+            }
+            ffmpeg::av_packet_free(&mut packet);
+        }
     }
 
     fn write_frame(&mut self, frame: *mut AVFrame) {
