@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam::channel::{self, Receiver, SendError};
 
-use windows::Win32::Media::Audio::{WAVE_FORMAT_2M16, WAVEFORMATEXTENSIBLE};
+use windows::Win32::Media::Audio::WAVEFORMATEXTENSIBLE;
 use windows::Win32::System::Com::CoUninitialize;
 use windows::core::GUID;
 use windows::{
