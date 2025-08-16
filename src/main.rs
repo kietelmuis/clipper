@@ -1,28 +1,33 @@
 use rdev::{Event, EventType, listen};
 
-use crate::capture::muxer::{CaptureMuxer, CaptureSettings};
+use crate::capture::muxer::{CaptureMuxer, CaptureSettings, MuxerCommand};
 
 mod capture;
 mod config;
 
-fn callback(event: Event) {
-    if event.event_type == EventType::KeyPress(rdev::Key::F9) {
-        println!("clipping!");
-    }
-}
-
 fn main() {
-    let config = config::Config::new();
+    let (tx, rx) = crossbeam::channel::unbounded::<MuxerCommand>();
 
-    std::thread::spawn(|| {
-        if let Err(error) = listen(callback) {
+    let config = config::Config::new();
+    let mut muxer = CaptureMuxer::new(CaptureSettings {
+        resolution: config.resolution,
+        fps: config.fps,
+    });
+
+    muxer.init();
+
+    std::thread::spawn(move || {
+        if let Err(error) = listen(move |event: Event| {
+            if event.event_type == EventType::KeyPress(rdev::Key::F9) {
+                println!("clipping!");
+                tx.send(MuxerCommand::Clip)
+                    .expect("failed to send clip command");
+            }
+        }) {
             eprintln!("Error: {:?}", error);
         }
     });
 
-    CaptureMuxer::new(CaptureSettings {
-        resolution: config.resolution,
-        fps: config.fps,
-    })
-    .init();
+    // blocking btw
+    muxer.start(rx);
 }
