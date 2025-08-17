@@ -9,15 +9,14 @@ use rusty_ffmpeg::ffi::{AVPacket, av_packet_free};
 struct Frame {
     pkt: NonNull<AVPacket>,
     time: Instant,
+    size: usize,
 }
 
 impl Drop for Frame {
     fn drop(&mut self) {
         unsafe {
             let mut pkt = self.pkt.as_ptr();
-            if !pkt.is_null() {
-                av_packet_free(&mut pkt);
-            }
+            av_packet_free(&mut pkt);
         }
     }
 }
@@ -25,6 +24,7 @@ impl Drop for Frame {
 pub struct ReplayBuffer {
     frames: VecDeque<Frame>,
     buffer_duration: Duration,
+    bytes: usize,
 }
 
 impl ReplayBuffer {
@@ -32,13 +32,22 @@ impl ReplayBuffer {
         Self {
             frames: VecDeque::new(),
             buffer_duration: duration,
+            bytes: 0,
         }
     }
 
     pub fn add_frame(&mut self, frame: *mut AVPacket) {
-        if frame.is_null() {
-            println!("frame given is invalid");
-            return;
+        let pkt = unsafe { &*frame };
+        let mut total = pkt.size.max(0) as usize;
+
+        // Calculate size of side data and add to total
+        if pkt.side_data_elems > 0 && !pkt.side_data.is_null() {
+            for i in 0..(pkt.side_data_elems as isize) {
+                unsafe {
+                    let sd = &*pkt.side_data.offset(i);
+                    total += sd.size.max(0) as usize;
+                }
+            }
         }
 
         let time = Instant::now();
@@ -46,7 +55,12 @@ impl ReplayBuffer {
         self.frames.push_back(Frame {
             pkt: unsafe { NonNull::new_unchecked(frame) },
             time,
+            size: total,
         });
+
+        self.bytes += total;
+        println!("[replay] buffer is now {} bytes", self.bytes);
+
         self.cleanup(time);
     }
 
@@ -63,7 +77,10 @@ impl ReplayBuffer {
             result.push(frame.pkt.as_ptr());
         }
 
-        println!("Retrieved {} frames for clip from buffer", result.len());
+        println!(
+            "[replay] collected {} frames for clip from buffer",
+            result.len()
+        );
         result
     }
 
@@ -72,7 +89,8 @@ impl ReplayBuffer {
 
         while let Some(frame) = self.frames.front() {
             if frame.time < cutoff {
-                self.frames.pop_front();
+                let old = self.frames.pop_front().unwrap();
+                self.bytes = self.bytes.saturating_sub(old.size);
             } else {
                 break;
             }
