@@ -110,32 +110,6 @@ pub struct CaptureMuxer {
     instant: Arc<Instant>,
 }
 
-impl Drop for CaptureMuxer {
-    fn drop(&mut self) {
-        unsafe {
-            println!("cleaning capturemuxer for drop");
-
-            // free the encoders
-            ffmpeg::avcodec_free_context(
-                &mut self.video_encoder.as_mut().unwrap().encoder.as_ptr(),
-            );
-            ffmpeg::avcodec_free_context(
-                &mut self.audio_encoder.as_mut().unwrap().encoder.as_ptr(),
-            );
-
-            // free the converter context
-            ffmpeg::sws_freeContext(
-                self.video_encoder
-                    .as_ref()
-                    .unwrap()
-                    .sws_context
-                    .unwrap()
-                    .as_ptr(),
-            );
-        }
-    }
-}
-
 const SAMPLE_FORMAT_IN: AVSampleFormat = AV_SAMPLE_FMT_FLT;
 const SAMPLE_FORMAT_OUT: AVSampleFormat = AV_SAMPLE_FMT_FLTP;
 
@@ -154,7 +128,7 @@ impl CaptureMuxer {
             audio_api,
             instant,
 
-            replay_buffer: ReplayBuffer::new(Duration::from_secs(3), FRAME_RATE as u64),
+            replay_buffer: ReplayBuffer::new(Duration::from_secs(3)),
 
             audio_encoder: None,
             video_encoder: None,
