@@ -1,6 +1,5 @@
 use std::{
     collections::VecDeque,
-    ptr::NonNull,
     time::{Duration, Instant},
 };
 
@@ -8,14 +7,14 @@ use rusty_ffmpeg::ffi::{self as ffmpeg, AVPacket};
 
 pub struct ReplayBuffer {
     pub bytes: usize,
-    frames: VecDeque<*mut AVPacket>,
-    max_frames: usize,
+    frames: VecDeque<(*mut AVPacket, Instant)>,
+    duration: Duration,
 }
 
 // unref and free all packets using drain to take ownership of pointers
 impl Drop for ReplayBuffer {
     fn drop(&mut self) {
-        for mut packet in self.frames.drain(..) {
+        for (mut packet, _) in self.frames.drain(..) {
             unsafe {
                 ffmpeg::av_packet_unref(packet);
                 ffmpeg::av_packet_free(&mut packet);
@@ -27,31 +26,35 @@ impl Drop for ReplayBuffer {
 
 impl ReplayBuffer {
     // calculate the frame cutoff amount upon cleaning
-    pub fn new(duration: Duration, fps: u64) -> Self {
-        let max_frames = (duration.as_secs() * fps) as usize;
+    pub fn new(duration: Duration) -> Self {
         Self {
-            frames: VecDeque::with_capacity(max_frames),
-            max_frames,
+            frames: VecDeque::new(),
+            duration,
             bytes: 0,
         }
     }
 
     // cutoff older frames outside of duration
     pub fn add_frame(&mut self, packet: *mut AVPacket) {
-        if self.frames.len() >= self.max_frames {
-            if let Some(mut oldest_packet) = self.frames.pop_front() {
-                unsafe {
-                    ffmpeg::av_packet_unref(oldest_packet);
-                    ffmpeg::av_packet_free(&mut oldest_packet);
+        let now = Instant::now();
+        self.frames.push_back((packet, now));
+
+        while let Some((_, oldest_instant)) = self.frames.front() {
+            if now.duration_since(*oldest_instant) > self.duration {
+                if let Some((mut oldest_packet, _)) = self.frames.pop_front() {
+                    unsafe {
+                        ffmpeg::av_packet_unref(oldest_packet);
+                        ffmpeg::av_packet_free(&mut oldest_packet);
+                    }
                 }
+            } else {
+                break;
             }
         }
-
-        self.frames.push_back(packet);
     }
 
     // simply clone the frames and into to write them
     pub fn get_frames(&self) -> Vec<*mut AVPacket> {
-        self.frames.clone().into()
+        self.frames.iter().map(|(packet, _)| *packet).collect()
     }
 }
