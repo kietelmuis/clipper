@@ -4,94 +4,54 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rusty_ffmpeg::ffi::{AVPacket, av_packet_free};
-
-struct Frame {
-    pkt: NonNull<AVPacket>,
-    time: Instant,
-    size: usize,
-}
-
-impl Drop for Frame {
-    fn drop(&mut self) {
-        unsafe {
-            let mut pkt = self.pkt.as_ptr();
-            av_packet_free(&mut pkt);
-        }
-    }
-}
+use rusty_ffmpeg::ffi::{self as ffmpeg, AVPacket};
 
 pub struct ReplayBuffer {
     pub bytes: usize,
-    frames: VecDeque<Frame>,
-    buffer_duration: Duration,
+    frames: VecDeque<*mut AVPacket>,
+    max_frames: usize,
+}
+
+// unref and free all packets using drain to take ownership of pointers
+impl Drop for ReplayBuffer {
+    fn drop(&mut self) {
+        for mut packet in self.frames.drain(..) {
+            unsafe {
+                ffmpeg::av_packet_unref(packet);
+                ffmpeg::av_packet_free(&mut packet);
+            }
+        }
+        self.frames.clear();
+    }
 }
 
 impl ReplayBuffer {
-    pub fn new(duration: Duration) -> Self {
+    // calculate the frame cutoff amount upon cleaning
+    pub fn new(duration: Duration, fps: u64) -> Self {
+        let max_frames = (duration.as_secs() * fps) as usize;
         Self {
-            frames: VecDeque::new(),
-            buffer_duration: duration,
+            frames: VecDeque::with_capacity(max_frames),
+            max_frames,
             bytes: 0,
         }
     }
 
-    pub fn add_frame(&mut self, frame: *mut AVPacket) {
-        let pkt = unsafe { &*frame };
-        let mut total = pkt.size.max(0) as usize;
-
-        // calculate size of side data and add to total
-        if pkt.side_data_elems > 0 && !pkt.side_data.is_null() {
-            for i in 0..(pkt.side_data_elems as isize) {
+    // cutoff older frames outside of duration
+    pub fn add_frame(&mut self, packet: *mut AVPacket) {
+        if self.frames.len() >= self.max_frames {
+            if let Some(mut oldest_packet) = self.frames.pop_front() {
                 unsafe {
-                    let sd = &*pkt.side_data.offset(i);
-                    total += sd.size.max(0) as usize;
+                    ffmpeg::av_packet_unref(oldest_packet);
+                    ffmpeg::av_packet_free(&mut oldest_packet);
                 }
             }
         }
 
-        let time = Instant::now();
-
-        self.frames.push_back(Frame {
-            pkt: unsafe { NonNull::new_unchecked(frame) },
-            time,
-            size: total,
-        });
-
-        self.bytes += total;
-        self.cleanup(time);
+        self.frames.push_back(packet);
     }
 
+    // simply clone the frames and into to write them
     pub fn get_frames(&self) -> Vec<*mut AVPacket> {
-        if self.frames.is_empty() {
-            println!("no frames in replay buffer for clip");
-            return Vec::new();
-        }
-
-        let mut result = Vec::with_capacity(self.frames.len());
-
-        // collect frame pointers
-        for frame in &self.frames {
-            result.push(frame.pkt.as_ptr());
-        }
-
-        println!(
-            "[replay] collected {} frames for clip from buffer",
-            result.len()
-        );
-        result
-    }
-
-    fn cleanup(&mut self, time: Instant) {
-        let cutoff = time - self.buffer_duration;
-
-        while let Some(frame) = self.frames.front() {
-            if frame.time < cutoff {
-                let old = self.frames.pop_front().unwrap();
-                self.bytes = self.bytes.saturating_sub(old.size);
-            } else {
-                break;
-            }
-        }
+        self.frames.clone().into()
     }
 }

@@ -18,6 +18,7 @@ use std::{
 use crate::capture::{
     audio::{AudioBuffer, AudioCaptureApi},
     video::{VideoBuffer, VideoCaptureApi},
+    windows::audio,
 };
 
 use super::replay::ReplayBuffer;
@@ -33,8 +34,7 @@ pub struct CaptureSettings {
 }
 
 // thanks https://ffmpeg.org/doxygen/trunk/mux_8c-example.html
-pub struct MuxStream {
-    stream: NonNull<AVStream>,
+pub struct MuxEncoder {
     encoder: NonNull<AVCodecContext>,
 
     // one can be null
@@ -42,7 +42,7 @@ pub struct MuxStream {
     swr_context: Option<NonNull<SwrContext>>, // used for audio
 }
 
-impl Drop for MuxStream {
+impl Drop for MuxEncoder {
     fn drop(&mut self) {
         unsafe {
             // free contexts if exist
@@ -60,11 +60,10 @@ impl Drop for MuxStream {
     }
 }
 
-impl MuxStream {
+impl MuxEncoder {
     fn flush_stream(&mut self, format_context: *mut AVFormatContext) {
         unsafe {
             let encoder = self.encoder.as_ptr();
-            let stream = self.stream.as_ptr();
 
             // send a null frame to signal EOF
             if ffmpeg::avcodec_send_frame(encoder, std::ptr::null_mut()) < 0 {
@@ -85,17 +84,9 @@ impl MuxStream {
                     break;
                 }
 
-                // rescale time from encoder to stream
-                ffmpeg::av_packet_rescale_ts(
-                    &mut packet,
-                    (*encoder).time_base,
-                    (*stream).time_base,
-                );
-                packet.stream_index = (*stream).index;
-
                 // write packet to output
                 if ffmpeg::av_interleaved_write_frame(format_context, &mut packet) < 0 {
-                    eprintln!("[encoder] error writing packet during flush");
+                    eprintln!("[encoder] error writing empty packet during flush");
                 }
 
                 ffmpeg::av_packet_unref(&mut packet);
@@ -113,9 +104,8 @@ pub struct CaptureMuxer {
     replay_buffer: ReplayBuffer,
 
     // data structs for audio/video
-    audio_stream: Option<MuxStream>,
-    video_stream: Option<MuxStream>,
-    format_context: Option<NonNull<AVFormatContext>>,
+    audio_encoder: Option<MuxEncoder>,
+    video_encoder: Option<MuxEncoder>,
 
     instant: Arc<Instant>,
 }
@@ -125,21 +115,17 @@ impl Drop for CaptureMuxer {
         unsafe {
             println!("cleaning capturemuxer for drop");
 
-            let format_context = self.format_context.unwrap().as_ptr();
-
-            // close the internal io context inside output
-            ffmpeg::avio_close((*format_context).pb);
-
             // free the encoders
-            ffmpeg::avcodec_free_context(&mut self.video_stream.as_mut().unwrap().encoder.as_ptr());
-            ffmpeg::avcodec_free_context(&mut self.audio_stream.as_mut().unwrap().encoder.as_ptr());
-
-            // free its streams
-            ffmpeg::avformat_free_context(format_context);
+            ffmpeg::avcodec_free_context(
+                &mut self.video_encoder.as_mut().unwrap().encoder.as_ptr(),
+            );
+            ffmpeg::avcodec_free_context(
+                &mut self.audio_encoder.as_mut().unwrap().encoder.as_ptr(),
+            );
 
             // free the converter context
             ffmpeg::sws_freeContext(
-                self.video_stream
+                self.video_encoder
                     .as_ref()
                     .unwrap()
                     .sws_context
@@ -154,6 +140,7 @@ const SAMPLE_FORMAT_IN: AVSampleFormat = AV_SAMPLE_FMT_FLT;
 const SAMPLE_FORMAT_OUT: AVSampleFormat = AV_SAMPLE_FMT_FLTP;
 
 const SAMPLE_RATE: i32 = 48000;
+const FRAME_RATE: i32 = 30;
 
 impl CaptureMuxer {
     pub fn new(_settings: CaptureSettings) -> Self {
@@ -167,85 +154,18 @@ impl CaptureMuxer {
             audio_api,
             instant,
 
-            replay_buffer: ReplayBuffer::new(Duration::from_secs(3)),
+            replay_buffer: ReplayBuffer::new(Duration::from_secs(3), FRAME_RATE as u64),
 
-            audio_stream: None,
-            video_stream: None,
-            format_context: None,
+            audio_encoder: None,
+            video_encoder: None,
         }
     }
 
     pub fn write_clip(&mut self) {
-        let format_context = self.format_context.unwrap().as_ptr();
-
-        println!("[encoder] getting frames from replay buffer");
-
-        let frames = self.replay_buffer.get_frames();
-
-        println!(
-            "[encoder] writing {} frames from replay buffer",
-            frames.len()
-        );
-
-        // loop over packet pointers and write them to context
-        for &packet in frames.iter() {
-            unsafe {
-                if ffmpeg::av_interleaved_write_frame(format_context, packet) != 0 {
-                    eprintln!("error writing frame from replay buffer");
-                }
-            }
-        }
-
-        println!("[encoder] flushing packet streams");
-        self.video_stream
-            .as_mut()
-            .unwrap()
-            .flush_stream(format_context);
-        self.audio_stream
-            .as_mut()
-            .unwrap()
-            .flush_stream(format_context);
-
-        println!("[encoder] attempting to write trailer");
-        unsafe {
-            if format_context.is_null() {
-                panic!("output context is null");
-            }
-
-            // try to write video with internal io
-            if ffmpeg::av_write_trailer(format_context) != 0 {
-                panic!("write fail");
-            };
-        }
-        println!("[encoder]: success!");
-    }
-
-    pub fn init(&mut self) {
-        // init all yo shi
-        unsafe { ffmpeg::avdevice_register_all() };
-
-        // todo: get from api
-        let frame_rate = 30;
-
-        // choose them formats bruh
-        let audio_format = AV_CODEC_ID_AAC;
-
-        let video_format = AV_CODEC_ID_H264;
-        let pixel_format = AV_PIX_FMT_YUV420P;
-
-        let video_timebase = ffmpeg::AVRational {
-            num: 1,
-            den: frame_rate,
-        };
-        let audio_timebase = ffmpeg::AVRational {
-            num: 1,
-            den: SAMPLE_RATE,
-        };
+        let file_name = CString::new("clip.mp4").expect("cstring fail");
+        let mut format_context: *mut AVFormatContext = std::ptr::null_mut();
 
         // share avformatcontext for video and audio
-        let mut format_context: *mut AVFormatContext = std::ptr::null_mut();
-        let file_name = CString::new("video.mp4").expect("cstring fail");
-
         if unsafe {
             ffmpeg::avformat_alloc_output_context2(
                 &mut format_context,
@@ -270,28 +190,98 @@ impl CaptureMuxer {
             panic!("failed to open avio for writing");
         }
 
-        self.format_context = NonNull::new(format_context);
+        let mut packets = self.replay_buffer.get_frames();
 
-        // create video and audio muxstreams
-        self.video_stream = Some(self.create_video_muxstream(
-            format_context,
-            video_format,
-            pixel_format,
-            video_timebase,
-        ));
+        println!(
+            "[encoder] writing {} frames from replay buffer",
+            packets.len()
+        );
 
-        self.audio_stream =
-            Some(self.create_audio_muxstream(format_context, audio_format as i32, audio_timebase));
+        let video_stream = self.create_stream(format_context, unsafe {
+            self.video_encoder.as_ref().unwrap().encoder.as_ref()
+        });
+        let audio_stream = self.create_stream(format_context, unsafe {
+            self.audio_encoder.as_ref().unwrap().encoder.as_ref()
+        });
+
+        // write file header
+        if unsafe { ffmpeg::avformat_write_header(format_context, std::ptr::null_mut()) } < 0 {
+            panic!("failed to write header");
+        }
+
+        // loop over packet pointers and write them to context
+        for &packet in packets.iter() {
+            unsafe {
+                // reference the packet so it doesnt get freed yet
+                ffmpeg::av_packet_ref(packet, packet);
+
+                if ffmpeg::av_interleaved_write_frame(format_context, packet) != 0 {
+                    eprintln!("error writing frame from replay buffer");
+                }
+
+                // unref it so it gets freed
+                ffmpeg::av_packet_unref(packet);
+            }
+        }
+
+        println!("[encoder] flushing packet streams");
+        self.video_encoder
+            .as_mut()
+            .unwrap()
+            .flush_stream(format_context);
+        self.audio_encoder
+            .as_mut()
+            .unwrap()
+            .flush_stream(format_context);
+
+        println!("[encoder] attempting to write clip");
+        unsafe {
+            if format_context.is_null() {
+                panic!("output context is null");
+            }
+
+            // try to write video with internal io
+            if ffmpeg::av_write_trailer(format_context) != 0 {
+                panic!("clip failed to write");
+            };
+
+            // clean up resources for clip
+            ffmpeg::avio_close((*format_context).pb);
+            ffmpeg::avformat_free_context(format_context);
+        }
+        println!("[encoder] success!");
     }
 
-    // creates the audio muxstream
+    pub fn init(&mut self) {
+        // init all yo shi
+        unsafe { ffmpeg::avdevice_register_all() };
+
+        // choose them formats bruh
+        let audio_format = AV_CODEC_ID_AAC;
+
+        let video_format = AV_CODEC_ID_H264;
+        let pixel_format = AV_PIX_FMT_YUV420P;
+
+        let video_timebase = ffmpeg::AVRational {
+            num: 1,
+            den: FRAME_RATE,
+        };
+        let audio_timebase = ffmpeg::AVRational {
+            num: 1,
+            den: SAMPLE_RATE,
+        };
+
+        // create video and audio muxstreams
+        self.video_encoder =
+            Some(self.create_video_muxencoder(video_format, pixel_format, video_timebase));
+
+        self.audio_encoder =
+            Some(self.create_audio_muxencoder(audio_format as i32, audio_timebase));
+    }
+
+    // creates the audio muxencoder
     // with specific settings, adjust later
-    fn create_audio_muxstream(
-        &mut self,
-        format_context: *mut AVFormatContext,
-        codec_id: i32,
-        timebase: AVRational,
-    ) -> MuxStream {
+    fn create_audio_muxencoder(&mut self, codec_id: i32, timebase: AVRational) -> MuxEncoder {
         let codec = unsafe { ffmpeg::avcodec_find_encoder(codec_id) };
         if codec.is_null() {
             panic!("failed to find codec");
@@ -315,37 +305,21 @@ impl CaptureMuxer {
         // set default layout and adjust settings
         unsafe {
             av_channel_layout_default(&mut channel_layout, 2);
-            (*encoder_ptr).ch_layout = channel_layout;
-            (*encoder_ptr).sample_fmt = SAMPLE_FORMAT_OUT;
-            (*encoder_ptr).sample_rate = SAMPLE_RATE;
-            (*encoder_ptr).codec_id = codec_id;
-            (*encoder_ptr).codec_type = AVMEDIA_TYPE_AUDIO;
-            (*encoder_ptr).time_base = timebase;
         }
+
+        (*encoder_ptr).ch_layout = channel_layout;
+        (*encoder_ptr).sample_fmt = SAMPLE_FORMAT_OUT;
+        (*encoder_ptr).sample_rate = SAMPLE_RATE;
+        (*encoder_ptr).codec_id = codec_id;
+        (*encoder_ptr).codec_type = AVMEDIA_TYPE_AUDIO;
+        (*encoder_ptr).time_base = timebase;
 
         // open the encoder
         if unsafe { ffmpeg::avcodec_open2(encoder_ptr, codec, std::ptr::null_mut()) } < 0 {
             panic!("failed to open encoder");
         }
 
-        // create and set new avstream
-        let mut stream =
-            NonNull::new(unsafe { avformat_new_stream(format_context, std::ptr::null()) })
-                .expect("failed to create stream");
-
-        if unsafe { avcodec_parameters_from_context((*stream.as_mut()).codecpar, encoder.as_ptr()) }
-            < 0
-        {
-            panic!("could not set encoder parameters");
-        }
-
-        // ensure stream time_base matches encoder time_base
-        unsafe {
-            (*stream.as_mut()).time_base = (*encoder_ptr).time_base;
-        }
-
-        MuxStream {
-            stream,
+        MuxEncoder {
             encoder,
             sws_context: None,
             swr_context: None,
@@ -354,13 +328,12 @@ impl CaptureMuxer {
 
     // creates the video muxstream
     // with specific settings, adjust later
-    fn create_video_muxstream(
+    fn create_video_muxencoder(
         &mut self,
-        format_context: *mut AVFormatContext,
         codec_id: AVCodecID,
         pixel_format: i32,
         timebase: AVRational,
-    ) -> MuxStream {
+    ) -> MuxEncoder {
         let codec = unsafe { ffmpeg::avcodec_find_encoder(codec_id) };
         if codec.is_null() {
             panic!("failed to find codec");
@@ -417,32 +390,35 @@ impl CaptureMuxer {
             panic!("failed to open encoder");
         }
 
-        // create and set new avstream
-        let mut stream =
-            NonNull::new(unsafe { avformat_new_stream(format_context, std::ptr::null()) })
-                .expect("failed to create stream");
-
-        // set stream id as format context stream index
-        if unsafe { avcodec_parameters_from_context((*stream.as_mut()).codecpar, encoder.as_ptr()) }
-            < 0
-        {
-            panic!("could not set encoder parameters");
-        }
-
-        // ensure stream time_base matches encoder time_base
-        unsafe {
-            (*stream.as_mut()).time_base = (*encoder_ptr).time_base;
-        }
-
-        MuxStream {
-            stream,
+        MuxEncoder {
             encoder,
             sws_context: None,
             swr_context: None,
         }
     }
 
-    fn process_video_frame(&mut self, video_buffer: VideoBuffer, frame_index: i64) {
+    fn create_stream(
+        &mut self,
+        format_context: *mut AVFormatContext,
+        encoder: &AVCodecContext,
+    ) -> *mut AVStream {
+        // create and set new avstream
+        let stream = unsafe { avformat_new_stream(format_context, std::ptr::null()) };
+
+        // set stream id as format context stream index
+        if unsafe { avcodec_parameters_from_context((*stream).codecpar, encoder) } < 0 {
+            panic!("could not set encoder parameters");
+        }
+
+        // ensure stream time_base matches encoder time_base
+        unsafe {
+            (*stream).time_base = (*encoder).time_base;
+        }
+
+        stream
+    }
+
+    fn process_video_frame(&mut self, video_buffer: VideoBuffer, audio_pts: i64) {
         // create empty yuv avframe
         let mut yuv_frame = unsafe { ffmpeg::av_frame_alloc() };
         if yuv_frame.is_null() {
@@ -454,7 +430,7 @@ impl CaptureMuxer {
             (*yuv_frame).format = ffmpeg::AV_PIX_FMT_YUV420P;
             (*yuv_frame).width = 1920;
             (*yuv_frame).height = 1080;
-            (*yuv_frame).pts = frame_index;
+            (*yuv_frame).pts = audio_pts;
         };
 
         // free if failed to allocate buffer data
@@ -468,7 +444,7 @@ impl CaptureMuxer {
         // converting a bgraframe into a yuvframe
         if unsafe {
             ffmpeg::sws_scale(
-                self.video_stream
+                self.video_encoder
                     .as_ref()
                     .unwrap()
                     .sws_context
@@ -502,7 +478,7 @@ impl CaptureMuxer {
         sample_format_out: AVSampleFormat,
         sample_rate: i32,
         audio_buffer: AudioBuffer,
-        frame_index: i64,
+        audio_pts: i64,
     ) {
         // allocate output frame
         let mut output_frame = unsafe { ffmpeg::av_frame_alloc() };
@@ -512,7 +488,7 @@ impl CaptureMuxer {
 
         let total_bytes = audio_buffer.buffer.len() as i32;
         let channels = unsafe {
-            &(*self.audio_stream.as_ref().unwrap().encoder.as_ptr())
+            &(*self.audio_encoder.as_ref().unwrap().encoder.as_ptr())
                 .ch_layout
                 .nb_channels
         }
@@ -528,7 +504,7 @@ impl CaptureMuxer {
 
         let max_out = unsafe {
             swr_get_out_samples(
-                self.audio_stream
+                self.audio_encoder
                     .as_mut()
                     .unwrap()
                     .swr_context
@@ -543,12 +519,12 @@ impl CaptureMuxer {
         unsafe {
             av_channel_layout_copy(
                 &mut (*output_frame).ch_layout,
-                &(*self.audio_stream.as_ref().unwrap().encoder.as_ptr()).ch_layout,
+                &(*self.audio_encoder.as_ref().unwrap().encoder.as_ptr()).ch_layout,
             );
             (*output_frame).format = sample_format_out;
             (*output_frame).sample_rate = sample_rate;
             (*output_frame).nb_samples = max_out;
-            (*output_frame).pts = frame_index;
+            (*output_frame).pts = audio_pts;
         }
 
         // allocate output buffer
@@ -566,12 +542,12 @@ impl CaptureMuxer {
         unsafe {
             av_channel_layout_copy(
                 &mut (*input_frame).ch_layout,
-                &(*self.audio_stream.as_ref().unwrap().encoder.as_ptr()).ch_layout,
+                &(*self.audio_encoder.as_ref().unwrap().encoder.as_ptr()).ch_layout,
             );
             (*input_frame).format = sample_format_in;
             (*input_frame).sample_rate = sample_rate;
             (*input_frame).nb_samples = sample_amount;
-            (*input_frame).pts = frame_index;
+            (*input_frame).pts = audio_pts;
         };
 
         // allocate input buffer
@@ -589,7 +565,7 @@ impl CaptureMuxer {
         // convert the input format to output format
         if unsafe {
             ffmpeg::swr_convert_frame(
-                self.audio_stream
+                self.audio_encoder
                     .as_mut()
                     .unwrap()
                     .swr_context
@@ -633,7 +609,7 @@ impl CaptureMuxer {
         }
 
         // set the context
-        self.video_stream
+        self.video_encoder
             .as_mut()
             .expect("video stream not initiliazed!")
             .sws_context = sws_context;
@@ -646,7 +622,7 @@ impl CaptureMuxer {
         sample_rate: i32,
     ) {
         let channel_layout =
-            &((unsafe { *self.audio_stream.as_ref().unwrap().encoder.as_ptr() }).ch_layout);
+            &((unsafe { *self.audio_encoder.as_ref().unwrap().encoder.as_ptr() }).ch_layout);
 
         let mut swr_context = std::ptr::null_mut::<SwrContext>();
         if unsafe {
@@ -672,7 +648,7 @@ impl CaptureMuxer {
         }
 
         // set the context
-        self.audio_stream
+        self.audio_encoder
             .as_mut()
             .expect("audio stream not initiliazed!")
             .swr_context = NonNull::new(swr_context);
@@ -683,19 +659,14 @@ impl CaptureMuxer {
         self.create_sws();
         self.create_swr(SAMPLE_FORMAT_IN, SAMPLE_FORMAT_OUT, SAMPLE_RATE);
 
-        let format_context = self.format_context.unwrap().as_ptr();
-
-        // write header for video
-        if unsafe { ffmpeg::avformat_write_header(format_context, std::ptr::null_mut()) } < 0 {
-            panic!("failed to write header");
-        }
-
         // different from internal instant
         // since it starts at ffmpeg ready
         let start_time = Instant::now();
         let mut last_print = Instant::now();
 
-        let mut frame_index = 1;
+        // av timestamps
+        let mut video_pts: i64 = 0;
+        let mut audio_pts: i64 = 0;
 
         // attempt to get video frames
         loop {
@@ -726,8 +697,8 @@ impl CaptureMuxer {
 
             match self.video_api.video_rx.try_recv() {
                 Ok(buf) => {
-                    self.process_video_frame(buf, frame_index);
-                    frame_index += 1;
+                    self.process_video_frame(buf, video_pts);
+                    video_pts += 1;
                 }
                 Err(TryRecvError::Empty) => (),
                 Err(_) => {
@@ -738,13 +709,25 @@ impl CaptureMuxer {
 
             match self.audio_api.audio_rx.try_recv() {
                 Ok(buf) => {
+                    let sample_amount = (buf.buffer.len()
+                        / unsafe {
+                            self.audio_encoder
+                                .as_ref()
+                                .unwrap()
+                                .encoder
+                                .as_ref()
+                                .ch_layout
+                                .nb_channels
+                        } as usize) as i64;
+
                     self.process_audio_frame(
                         SAMPLE_FORMAT_IN,
                         SAMPLE_FORMAT_OUT,
                         SAMPLE_RATE,
                         buf,
-                        frame_index,
+                        audio_pts,
                     );
+                    audio_pts += sample_amount;
                 }
                 Err(TryRecvError::Empty) => (),
                 Err(_) => {
@@ -756,19 +739,21 @@ impl CaptureMuxer {
     }
 
     fn encode_frame(&mut self, frame: *mut AVFrame) {
-        let encoder = unsafe { self.video_stream.as_mut().unwrap().encoder.as_mut() };
+        let encoder = unsafe { self.video_encoder.as_mut().unwrap().encoder.as_mut() };
 
         // send frame to encoder
         let ret = unsafe { ffmpeg::avcodec_send_frame(encoder, frame) };
         if ret < 0 {
-            panic!("failed to send frame to encoder")
+            eprintln!("failed to send frame to encoder");
+            return;
         }
 
         // receive packets from encoder
         loop {
             let mut packet = unsafe { ffmpeg::av_packet_alloc() };
             if packet.is_null() {
-                panic!("Failed to allocate AVPacket");
+                eprintln!("Failed to allocate AVPacket");
+                return;
             }
 
             let ret = unsafe { ffmpeg::avcodec_receive_packet(encoder, packet) };
@@ -784,6 +769,10 @@ impl CaptureMuxer {
                 }
                 eprintln!("[video] avcodec_receive_packet error={}", ret);
                 break;
+            }
+
+            unsafe {
+                (*packet).stream_index = 0;
             }
 
             // add packet to replay buffer (buffer takes ownership)
@@ -792,19 +781,21 @@ impl CaptureMuxer {
     }
 
     fn encode_audio(&mut self, frame: *mut AVFrame) {
-        let encoder = unsafe { self.audio_stream.as_mut().unwrap().encoder.as_mut() };
+        let encoder = unsafe { self.audio_encoder.as_mut().unwrap().encoder.as_mut() };
 
         // send frame to encoder
         let ret = unsafe { ffmpeg::avcodec_send_frame(encoder, frame) };
         if ret < 0 {
-            panic!("failed to send frame to encoder")
+            eprintln!("failed to send frame to encoder");
+            return;
         }
 
         // receive packets from encoder
         loop {
             let mut packet = unsafe { ffmpeg::av_packet_alloc() };
             if packet.is_null() {
-                panic!("Failed to allocate AVPacket");
+                eprintln!("Failed to allocate AVPacket");
+                return;
             }
 
             let ret = unsafe { ffmpeg::avcodec_receive_packet(encoder, packet) };
@@ -820,6 +811,10 @@ impl CaptureMuxer {
                 }
                 eprintln!("[video] avcodec_receive_packet error={}", ret);
                 break;
+            }
+
+            unsafe {
+                (*packet).stream_index = 1;
             }
 
             // add packet to replay buffer (buffer takes ownership)
