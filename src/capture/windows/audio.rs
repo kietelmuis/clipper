@@ -225,7 +225,7 @@ impl InternalCaptureApi {
         let mut staging_buf = Vec::with_capacity(samples_per_frame * 2);
         let mut last_time = self.instant.elapsed();
 
-        loop {
+        'audio_loop: loop {
             unsafe {
                 WaitForSingleObject(handle, INFINITE);
             }
@@ -258,8 +258,7 @@ impl InternalCaptureApi {
                     break;
                 }
 
-                // process audio data here
-                // SAFETY: WASAPI guarantees the buffer contains float samples
+                // convert data pointer to rust f32 slice
                 let samples = unsafe {
                     std::slice::from_raw_parts(
                         data_ptr as *const f32,
@@ -267,11 +266,9 @@ impl InternalCaptureApi {
                     )
                 };
 
-                // Process samples (example: simple volume adjustment)
-                let processed_samples: Vec<f32> = samples
-                    .iter()
-                    .map(|sample| sample * 0.8) // Reduce volume by 20%
-                    .collect();
+                // reduce volume by 20%
+                let processed_samples: Vec<f32> =
+                    samples.iter().map(|sample| sample * 0.8).collect();
 
                 staging_buf.extend_from_slice(&processed_samples);
 
@@ -279,7 +276,7 @@ impl InternalCaptureApi {
                 unsafe { capture_client.ReleaseBuffer(num_frames) }
                     .expect("failed to release buffer");
 
-                // Send complete frames
+                // send complete frames
                 while staging_buf.len() >= samples_per_frame {
                     let frame = AudioBuffer {
                         buffer: staging_buf.drain(..samples_per_frame).collect(),
@@ -290,6 +287,7 @@ impl InternalCaptureApi {
 
                     if let Err(e) = self.callback.send(frame) {
                         eprintln!("Failed to send audio frame: {}", e);
+                        break 'audio_loop;
                     }
                 }
             }
