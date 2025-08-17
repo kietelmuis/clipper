@@ -22,9 +22,9 @@ impl Drop for Frame {
 }
 
 pub struct ReplayBuffer {
+    pub bytes: usize,
     frames: VecDeque<Frame>,
     buffer_duration: Duration,
-    bytes: usize,
 }
 
 impl ReplayBuffer {
@@ -40,7 +40,7 @@ impl ReplayBuffer {
         let pkt = unsafe { &*frame };
         let mut total = pkt.size.max(0) as usize;
 
-        // Calculate size of side data and add to total
+        // calculate size of side data and add to total
         if pkt.side_data_elems > 0 && !pkt.side_data.is_null() {
             for i in 0..(pkt.side_data_elems as isize) {
                 unsafe {
@@ -59,8 +59,6 @@ impl ReplayBuffer {
         });
 
         self.bytes += total;
-        println!("[replay] buffer is now {} bytes", self.bytes);
-
         self.cleanup(time);
     }
 

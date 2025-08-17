@@ -4,6 +4,7 @@ use crate::capture::muxer::{CaptureMuxer, CaptureSettings, MuxerCommand};
 
 mod capture;
 mod config;
+mod util;
 
 fn main() {
     let (tx, rx) = crossbeam::channel::unbounded::<MuxerCommand>();
