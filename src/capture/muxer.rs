@@ -383,9 +383,9 @@ impl CaptureMuxer {
 
         // h264 all-i options
         // to optimize memory usage
-        (*encoder_ptr).gop_size = 1;
-        (*encoder_ptr).max_b_frames = 0;
-        (*encoder_ptr).bit_rate = 50 * 1000 * 1000; // 50 mbps
+        (*encoder_ptr).gop_size = 30;
+        (*encoder_ptr).max_b_frames = 2;
+        (*encoder_ptr).bit_rate = 10 * 1000 * 1000; // 50 mbps
 
         // rate control
         (*encoder_ptr).rc_max_rate = (*encoder_ptr).bit_rate;
@@ -489,7 +489,7 @@ impl CaptureMuxer {
             panic!("could not allocate frame buffer!");
         }
 
-        self.write_frame(yuv_frame);
+        self.encode_frame(yuv_frame);
 
         unsafe {
             ffmpeg::av_frame_free(&mut yuv_frame);
@@ -603,7 +603,7 @@ impl CaptureMuxer {
             panic!("audio convert failed");
         }
 
-        self.write_audio(output_frame);
+        self.encode_audio(output_frame);
 
         unsafe {
             ffmpeg::av_frame_free(&mut input_frame);
@@ -713,49 +713,50 @@ impl CaptureMuxer {
                 }
             }
 
-            // Print status every second
+            // print status every second
             if last_print.elapsed() >= Duration::from_secs(1) {
-                println!("[encoder] recording for {}s", seconds_elapsed);
+                println!(
+                    "[encoder] recording for {}s (using {} ram)",
+                    seconds_elapsed,
+                    crate::util::humanize_bytes(self.replay_buffer.bytes as u64)
+                );
+
                 last_print = std::time::Instant::now();
             }
 
-            // Receive frames without timeout - blocking is acceptable
-            let video_buffer = match self.video_api.video_rx.recv() {
-                Ok(buf) => buf,
+            match self.video_api.video_rx.try_recv() {
+                Ok(buf) => {
+                    self.process_video_frame(buf, frame_index);
+                    frame_index += 1;
+                }
+                Err(TryRecvError::Empty) => (),
                 Err(_) => {
-                    // Handle disconnection
                     eprintln!("Video channel disconnected");
                     break;
                 }
             };
 
-            let audio_buffer = match self.audio_api.audio_rx.recv() {
-                Ok(buf) => buf,
+            match self.audio_api.audio_rx.try_recv() {
+                Ok(buf) => {
+                    self.process_audio_frame(
+                        SAMPLE_FORMAT_IN,
+                        SAMPLE_FORMAT_OUT,
+                        SAMPLE_RATE,
+                        buf,
+                        frame_index,
+                    );
+                }
+                Err(TryRecvError::Empty) => (),
                 Err(_) => {
-                    // Handle disconnection
                     eprintln!("Audio channel disconnected");
                     break;
                 }
             };
-
-            // process av
-            self.process_audio_frame(
-                SAMPLE_FORMAT_IN,
-                SAMPLE_FORMAT_OUT,
-                SAMPLE_RATE,
-                audio_buffer,
-                frame_index,
-            );
-            self.process_video_frame(video_buffer, frame_index);
-
-            frame_index += 1;
         }
     }
 
-    fn write_frame(&mut self, frame: *mut AVFrame) {
+    fn encode_frame(&mut self, frame: *mut AVFrame) {
         let encoder = unsafe { self.video_stream.as_mut().unwrap().encoder.as_mut() };
-        let stream = unsafe { self.video_stream.as_mut().unwrap().stream.as_ref() };
-        let format_context = unsafe { self.format_context.unwrap().as_mut() };
 
         // send frame to encoder
         let ret = unsafe { ffmpeg::avcodec_send_frame(encoder, frame) };
@@ -784,38 +785,14 @@ impl CaptureMuxer {
                 eprintln!("[video] avcodec_receive_packet error={}", ret);
                 break;
             }
-
-            // configure packet
-            unsafe {
-                ffmpeg::av_packet_rescale_ts(packet, (*encoder).time_base, (*stream).time_base);
-                (*packet).stream_index = (*stream).index;
-            };
-            println!("video packet configured");
-
-            // write packet to file
-            if unsafe { ffmpeg::av_interleaved_write_frame(format_context, packet) } < 0 {
-                panic!("failed to write frame");
-            }
-
-            eprintln!(
-                "[debug video] packet ptr={:?} size={} pts={} dts={} time_base={}/{}",
-                packet,
-                unsafe { (*packet).size },
-                unsafe { (*packet).pts },
-                unsafe { (*packet).dts },
-                (*stream).time_base.num,
-                (*stream).time_base.den,
-            );
 
             // add packet to replay buffer (buffer takes ownership)
             self.replay_buffer.add_frame(packet);
         }
     }
 
-    fn write_audio(&mut self, frame: *mut AVFrame) {
+    fn encode_audio(&mut self, frame: *mut AVFrame) {
         let encoder = unsafe { self.audio_stream.as_mut().unwrap().encoder.as_mut() };
-        let stream = unsafe { self.audio_stream.as_mut().unwrap().stream.as_ref() };
-        let format_context = unsafe { self.format_context.unwrap().as_mut() };
 
         // send frame to encoder
         let ret = unsafe { ffmpeg::avcodec_send_frame(encoder, frame) };
@@ -844,28 +821,6 @@ impl CaptureMuxer {
                 eprintln!("[video] avcodec_receive_packet error={}", ret);
                 break;
             }
-
-            // configure packet
-            unsafe {
-                ffmpeg::av_packet_rescale_ts(packet, (*encoder).time_base, (*stream).time_base);
-                (*packet).stream_index = (*stream).index;
-            };
-            println!("audio packet configured");
-
-            // write packet to file
-            if unsafe { ffmpeg::av_interleaved_write_frame(format_context, packet) } < 0 {
-                panic!("failed to write frame");
-            }
-
-            eprintln!(
-                "[debug audio] packet ptr={:?} size={} pts={} dts={} time_base={}/{}",
-                packet,
-                unsafe { (*packet).size },
-                unsafe { (*packet).pts },
-                unsafe { (*packet).dts },
-                (*stream).time_base.num,
-                (*stream).time_base.den,
-            );
 
             // add packet to replay buffer (buffer takes ownership)
             self.replay_buffer.add_frame(packet);
