@@ -20,7 +20,7 @@ fn main() {
     std::thread::spawn(move || {
         if let Err(error) = listen(move |event: Event| {
             if event.event_type == EventType::KeyPress(rdev::Key::F9) {
-                println!("clipping!");
+                println!("[main] clipping!");
                 tx.send(MuxerCommand::Clip)
                     .expect("failed to send clip command");
             }
