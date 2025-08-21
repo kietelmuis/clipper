@@ -26,7 +26,7 @@ use windows::{
 #[derive(Debug)]
 pub struct AudioBuffer {
     pub buffer: Vec<f32>,
-    pub time: Duration,
+    pub timestamp: Instant,
 }
 
 struct InternalCaptureApi {
@@ -223,7 +223,6 @@ impl InternalCaptureApi {
         let samples_per_frame = FRAME_SIZE * self.channels.unwrap() as usize;
 
         let mut staging_buf = Vec::with_capacity(samples_per_frame * 2);
-        let mut last_time = self.instant.elapsed();
 
         'audio_loop: loop {
             unsafe {
@@ -280,10 +279,8 @@ impl InternalCaptureApi {
                 while staging_buf.len() >= samples_per_frame {
                     let frame = AudioBuffer {
                         buffer: staging_buf.drain(..samples_per_frame).collect(),
-                        time: last_time,
+                        timestamp: Instant::now(),
                     };
-
-                    last_time = self.instant.elapsed();
 
                     if let Err(e) = self.callback.send(frame) {
                         eprintln!("Failed to send audio frame: {}", e);
