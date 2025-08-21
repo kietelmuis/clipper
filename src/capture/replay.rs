@@ -16,6 +16,8 @@ impl Drop for ReplayBuffer {
     fn drop(&mut self) {
         for (mut packet, _) in self.frames.drain(..) {
             unsafe {
+                self.bytes = self.bytes.saturating_sub((*packet).size.max(0) as usize);
+
                 ffmpeg::av_packet_unref(packet);
                 ffmpeg::av_packet_free(&mut packet);
             }
@@ -37,16 +39,23 @@ impl ReplayBuffer {
     // cutoff older frames outside of duration
     pub fn add_frame(&mut self, packet: *mut AVPacket) {
         let now = Instant::now();
+
+        unsafe {
+            self.bytes = self.bytes.saturating_add((*packet).size.max(0) as usize);
+        }
+
         self.frames.push_back((packet, now));
 
-        while let Some((_, oldest_instant)) = self.frames.front() {
+        // evict memory hungry old frames
+        while let Some((oldest_packet, oldest_instant)) = self.frames.front() {
             if now.duration_since(*oldest_instant) > self.duration {
-                if let Some((mut oldest_packet, _)) = self.frames.pop_front() {
-                    unsafe {
-                        ffmpeg::av_packet_unref(oldest_packet);
-                        ffmpeg::av_packet_free(&mut oldest_packet);
-                    }
+                let mut to_free = *oldest_packet;
+                unsafe {
+                    self.bytes = self.bytes.saturating_sub((*to_free).size.max(0) as usize);
+                    ffmpeg::av_packet_unref(to_free);
+                    ffmpeg::av_packet_free(&mut to_free);
                 }
+                self.frames.pop_front();
             } else {
                 break;
             }
