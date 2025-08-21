@@ -1,3 +1,4 @@
+use notify_rust::Notification;
 use rdev::{Event, EventType, listen};
 use std::time::Duration;
 
@@ -22,6 +23,14 @@ fn main() {
         if let Err(error) = listen(move |event: Event| {
             if event.event_type == EventType::KeyPress(rdev::Key::F9) {
                 println!("[main] clipping!");
+
+                Notification::new()
+                    .appname("clipper")
+                    .summary("video clipped!")
+                    .body("saved last 3s to disk")
+                    .show()
+                    .expect("failed to show notification");
+
                 tx.send(MuxerCommand::Clip)
                     .expect("failed to send clip command");
             }

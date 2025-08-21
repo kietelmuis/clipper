@@ -1,8 +1,5 @@
 use crossbeam::channel::{self, Receiver, Sender};
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Instant};
 
 use windows::{
     Foundation::TypedEventHandler,
@@ -15,7 +12,7 @@ use windows::{
             Direct3D11::{IDirect3DDevice, IDirect3DSurface},
             DirectXPixelFormat,
         },
-        DisplayId,
+        DisplayId, SizeInt32,
     },
     Win32::{
         Foundation::HMODULE,
@@ -36,12 +33,14 @@ use windows::{
     core::{IInspectable, Interface, Ref},
 };
 
+use crate::capture::video::Resolution;
+
 #[derive(Debug)]
 pub struct VideoBuffer {
     pub bgra: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
-    pub timestamp: Duration,
+    pub resolution: Resolution,
+    pub row_pitch: u32,
+    pub timestamp: Instant,
 }
 
 impl Drop for VideoCaptureApi {
@@ -53,6 +52,7 @@ impl Drop for VideoCaptureApi {
 
 pub struct VideoCaptureApi {
     pub video_rx: Receiver<VideoBuffer>,
+    pub resolution: Option<Resolution>,
 
     instant: Arc<Instant>,
     callback: Arc<Sender<VideoBuffer>>,
@@ -64,12 +64,13 @@ pub struct VideoCaptureApi {
 
 impl VideoCaptureApi {
     pub fn new(instant: Arc<Instant>) -> Self {
-        let (video_tx, video_rx) = channel::unbounded::<VideoBuffer>();
+        let (video_tx, video_rx) = channel::bounded::<VideoBuffer>(1);
 
         let mut capture_api = Self {
             video_rx,
 
             instant,
+            resolution: None,
             callback: Arc::new(video_tx),
 
             frame_pool: None,
@@ -129,6 +130,16 @@ impl VideoCaptureApi {
         let capture_item =
             GraphicsCaptureItem::TryCreateFromDisplayId(DisplayId { Value: 0 }).expect("ok");
 
+        let size = capture_item.Size().expect("failed to get display size");
+        self.resolution = Some(Resolution {
+            width: size.Width,
+            height: size.Height,
+        });
+        println!(
+            "[winapi] resolution is {:?}",
+            self.resolution.as_ref().unwrap()
+        );
+
         // create frame pool with d3d devie and monitor size
         let frame_pool = Arc::new(
             Direct3D11CaptureFramePool::CreateFreeThreaded(
@@ -140,14 +151,13 @@ impl VideoCaptureApi {
             .expect("failed to create frame pool"),
         );
 
-        // save framepool in struct to avoid out of scope
+        // save framepool in struct to avoid out of scoping
         self.frame_pool = Some(frame_pool.clone());
 
         let instant_clone = self.instant.clone();
         let callback_clone = self.callback.clone();
 
         // bind to frame
-        println!("[video] event bound");
         let handler = TypedEventHandler::new(
             move |fpool: Ref<Direct3D11CaptureFramePool>, _: Ref<IInspectable>| {
                 if let Some(pool) = fpool.as_ref() {
@@ -169,6 +179,7 @@ impl VideoCaptureApi {
         frame_pool
             .FrameArrived(self.frame_handler.as_ref().expect("handler not set"))
             .expect("failed to set frame arrived");
+        println!("[winapi] frame event bound");
 
         // create and start capture session
         let capture_session = frame_pool
@@ -190,6 +201,7 @@ impl VideoCaptureApi {
         instant: Arc<Instant>,
         callback: Arc<Sender<VideoBuffer>>,
     ) {
+        let timestamp = Instant::now();
         let d3d_surface: IDirect3DSurface = frame.Surface().expect("failed to get frame surface");
 
         let dxgi_interface_access: IDirect3DDxgiInterfaceAccess = d3d_surface
@@ -234,9 +246,12 @@ impl VideoCaptureApi {
         let buffer = VideoBuffer {
             bgra: unsafe { std::slice::from_raw_parts(mapped.pData as *const u8, buffer_size) }
                 .to_vec(),
-            height: content_size.Height as u32,
-            width: content_size.Width as u32,
-            timestamp: instant.elapsed(),
+            row_pitch: mapped.RowPitch,
+            resolution: Resolution {
+                width: content_size.Width,
+                height: content_size.Height,
+            },
+            timestamp,
         };
 
         unsafe {
