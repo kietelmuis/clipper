@@ -9,6 +9,7 @@ use rusty_ffmpeg::ffi::{
 };
 
 use std::{
+    collections::VecDeque,
     ffi::CString,
     ptr::NonNull,
     sync::Arc,
@@ -17,6 +18,7 @@ use std::{
 
 use crate::capture::{
     audio::{AudioBuffer, AudioCaptureApi},
+    framepool::FramePool,
     video::{Resolution, VideoBuffer, VideoCaptureApi},
 };
 
@@ -100,12 +102,15 @@ pub struct CaptureMuxer {
     video_api: VideoCaptureApi,
     audio_api: AudioCaptureApi,
 
-    // replay buffer
+    // sub structs
     replay_buffer: ReplayBuffer,
+    frame_pool: FramePool,
 
     // data structs for audio/video
     audio_encoder: Option<MuxEncoder>,
     video_encoder: Option<MuxEncoder>,
+
+    pending_frames: VecDeque<*mut AVFrame>,
 
     instant: Arc<Instant>,
 
@@ -126,12 +131,24 @@ impl CaptureMuxer {
         let video_api = VideoCaptureApi::new(instant.clone());
         let audio_api = AudioCaptureApi::new(instant.clone());
 
+        // Create a FramePool with pre-allocated frames
+        let mut frame_pool = FramePool::new();
+
+        // Pre-allocate 10 frames
+        for _ in 0..10 {
+            let frame = unsafe { ffmpeg::av_frame_alloc() };
+            frame_pool.return_frame(frame);
+        }
+
         Self {
             video_api,
             audio_api,
             instant,
 
             replay_buffer: ReplayBuffer::new(Duration::from_secs(3)),
+            frame_pool: frame_pool,
+
+            pending_frames: VecDeque::with_capacity(30),
 
             audio_encoder: None,
             video_encoder: None,
@@ -142,6 +159,10 @@ impl CaptureMuxer {
     }
 
     pub fn write_clip(&mut self) {
+        while !self.pending_frames.is_empty() {
+            self.process_pending();
+        }
+
         let file_name = CString::new("clip.mp4").expect("cstring fail");
         let mut format_context: *mut AVFormatContext = std::ptr::null_mut();
 
@@ -275,6 +296,16 @@ impl CaptureMuxer {
         println!("[encoder] success!");
     }
 
+    fn process_pending(&mut self) {
+        let frames_to_return = std::cmp::min(self.pending_frames.len(), 2);
+
+        for _ in 0..frames_to_return {
+            if let Some(frame) = self.pending_frames.pop_front() {
+                self.frame_pool.return_frame(frame);
+            }
+        }
+    }
+
     pub fn init(&mut self) {
         // init all yo shi
         unsafe { ffmpeg::avdevice_register_all() };
@@ -379,9 +410,9 @@ impl CaptureMuxer {
 
         // h264 all-i options
         // to optimize memory usage
-        (*encoder_ptr).gop_size = 30;
-        (*encoder_ptr).max_b_frames = 2;
-        (*encoder_ptr).bit_rate = 10 * 1000 * 1000; // 50 mbps
+        (*encoder_ptr).gop_size = 1;
+        (*encoder_ptr).max_b_frames = 0;
+        (*encoder_ptr).bit_rate = 10 * 1000 * 1000; // 10 mbps
 
         // rate control
         (*encoder_ptr).rc_max_rate = (*encoder_ptr).bit_rate;
@@ -448,7 +479,7 @@ impl CaptureMuxer {
         }
 
         // create empty yuv avframe
-        let mut yuv_frame = unsafe { ffmpeg::av_frame_alloc() };
+        let mut yuv_frame = self.frame_pool.get_frame();
         if yuv_frame.is_null() {
             panic!("Failed to allocate AVFrame!");
         }
@@ -459,15 +490,14 @@ impl CaptureMuxer {
             (*yuv_frame).width = self.video_api.resolution.as_ref().unwrap().width;
             (*yuv_frame).height = self.video_api.resolution.as_ref().unwrap().height;
             (*yuv_frame).pts = self.video_pts;
-        };
 
-        // free if failed to allocate buffer data
-        if unsafe { ffmpeg::av_frame_get_buffer(yuv_frame, 32) } < 0 {
-            unsafe {
-                ffmpeg::av_frame_free(&mut yuv_frame);
+            if ffmpeg::av_frame_get_buffer(yuv_frame, 32) < 0 {
+                panic!("could not allocate frame buffer!");
             }
-            panic!("could not allocate frame buffer!");
-        }
+            if ffmpeg::av_frame_make_writable(yuv_frame) < 0 {
+                panic!("failed to make frame writable");
+            }
+        };
 
         // converting a bgraframe into a yuvframe
         if unsafe {
@@ -493,11 +523,31 @@ impl CaptureMuxer {
             panic!("could not allocate frame buffer!");
         }
 
-        self.encode_frame(yuv_frame);
+        println!("frame data ptr: {:?}", unsafe { (*yuv_frame).data[0] });
+        println!(
+            "PTS: {}, Encoder time_base: {}/{}",
+            self.video_pts,
+            unsafe {
+                self.video_encoder
+                    .as_ref()
+                    .unwrap()
+                    .encoder
+                    .as_ref()
+                    .time_base
+                    .num
+            },
+            unsafe {
+                self.video_encoder
+                    .as_ref()
+                    .unwrap()
+                    .encoder
+                    .as_ref()
+                    .time_base
+                    .den
+            }
+        );
 
-        unsafe {
-            ffmpeg::av_frame_free(&mut yuv_frame);
-        }
+        self.encode_frame(yuv_frame);
     }
 
     fn process_audio_frame(
@@ -700,6 +750,7 @@ impl CaptureMuxer {
         // since it starts at ffmpeg ready
         let start_time = Instant::now();
         let mut last_print = Instant::now();
+        let mut last_frame_process = Instant::now();
 
         // attempt to get video frames
         loop {
@@ -715,6 +766,12 @@ impl CaptureMuxer {
                 Err(_) => {
                     eprintln!("Command channel disconnected")
                 }
+            }
+
+            // process pending frames at 100ms
+            if last_frame_process.elapsed() >= Duration::from_millis(100) {
+                self.process_pending();
+                last_frame_process = Instant::now();
             }
 
             // print status every second
@@ -769,8 +826,11 @@ impl CaptureMuxer {
         let ret = unsafe { ffmpeg::avcodec_send_frame(encoder, frame) };
         if ret < 0 {
             eprintln!("failed to send frame to encoder");
+            self.frame_pool.return_frame(frame);
             return;
         }
+
+        let mut received = 0;
 
         // receive packets from encoder
         loop {
@@ -801,6 +861,13 @@ impl CaptureMuxer {
 
             // add packet to replay buffer (buffer takes ownership)
             self.replay_buffer.add_frame(packet);
+            received += 1;
+        }
+
+        if received > 0 {
+            self.frame_pool.return_frame(frame);
+        } else {
+            self.pending_frames.push_back(frame);
         }
 
         self.video_pts += 1;

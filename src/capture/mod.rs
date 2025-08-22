@@ -4,6 +4,7 @@ mod linux;
 mod windows;
 
 mod audio;
+mod framepool;
 pub mod muxer;
 mod replay;
 mod video;
