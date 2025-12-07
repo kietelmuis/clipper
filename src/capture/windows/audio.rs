@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use crossbeam::channel::{self, Receiver, SendError};
 
 use windows::Win32::Media::Audio::WAVEFORMATEXTENSIBLE;
-use windows::Win32::System::Com::CoUninitialize;
+use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::core::GUID;
 use windows::{
     Win32::{
@@ -59,14 +59,18 @@ const WAVE_EXTENSIBLE: u16 = 65534;
 // close event handle upon captureapi drop
 impl Drop for InternalCaptureApi {
     fn drop(&mut self) {
-        println!("cleaning audio api");
+        println!("cleaning internal audio api");
         unsafe {
-            CoUninitialize();
-
             if let Some(handle) = self.event_handle {
                 _ = CloseHandle(handle);
             }
         }
+    }
+}
+
+impl Drop for AudioCaptureApi {
+    fn drop(&mut self) {
+        println!("cleaning audio api");
     }
 }
 
@@ -114,6 +118,11 @@ impl AudioCaptureApi {
     }
 
     fn init(&mut self) {
+        // initialize COM
+        unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED).unwrap();
+        }
+
         // create audio device enumerator
         let enumerator = unsafe {
             CoCreateInstance::<Option<&IUnknown>, IMMDeviceEnumerator>(

@@ -21,7 +21,7 @@ pipewire = "0.8.0"
 
 [target.'cfg(windows)'.dependencies]
 windows-result = "0.3.4"
-windows = { version = "0.61.3", features = [
+windows = { version = "0.62.2", features = [
 	# audio
 	"Win32_Devices_FunctionDiscovery",
 	"Win32_Media_Audio",

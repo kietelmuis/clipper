@@ -1,6 +1,5 @@
 use std::{
     collections::VecDeque,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -71,16 +70,7 @@ impl ReplayBuffer {
     }
 
     // simply clone the frames and into to write them
-    pub fn get_frames(&self) -> Vec<Arc<Packet>> {
-        self.frames
-            .iter()
-            .map(|(packet, _)| unsafe {
-                let cloned = unsafe {
-                    let raw: *mut sys::AVPacket = sys::av_packet_clone(packet.as_ptr());
-                    Packet { 0: raw }
-                };
-                Arc::new(cloned)
-            })
-            .collect()
+    pub fn get_frames(&self) -> Vec<&Packet> {
+        self.frames.iter().map(|(packet, _)| packet).collect()
     }
 }
