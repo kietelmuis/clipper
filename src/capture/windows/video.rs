@@ -5,14 +5,13 @@ use windows::{
     Foundation::TypedEventHandler,
     Graphics::{
         Capture::{
-            Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem,
+            Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCapturePicker,
             GraphicsCaptureSession,
         },
         DirectX::{
             Direct3D11::{IDirect3DDevice, IDirect3DSurface},
             DirectXPixelFormat,
         },
-        DisplayId, SizeInt32,
     },
     Win32::{
         Foundation::HMODULE,
@@ -63,7 +62,7 @@ pub struct VideoCaptureApi {
 }
 
 impl VideoCaptureApi {
-    pub fn new(instant: Arc<Instant>) -> Self {
+    pub async fn new(instant: Arc<Instant>) -> Self {
         let (video_tx, video_rx) = channel::bounded::<VideoBuffer>(1);
 
         let mut capture_api = Self {
@@ -78,7 +77,7 @@ impl VideoCaptureApi {
             capture_session: None,
         };
 
-        capture_api.init();
+        capture_api.init().await;
         capture_api
     }
 
@@ -96,7 +95,7 @@ impl VideoCaptureApi {
         Ok(())
     }
 
-    fn init(&mut self) {
+    async fn init(&mut self) {
         let mut device_option = None;
         unsafe {
             D3D11CreateDevice(
@@ -126,9 +125,18 @@ impl VideoCaptureApi {
                 .cast()
                 .expect("failed to cast d3d device");
 
-        // create capture item from primary display
-        let capture_item =
-            GraphicsCaptureItem::TryCreateFromDisplayId(DisplayId { Value: 0 }).expect("ok");
+        // let hwnd = unsafe { GetConsoleWindow() };
+        // if hwnd.0 as u64 == 0 {
+        //     panic!("failed to get console window handle");
+        // }
+
+        // // create capture item from console window
+        // let interop: IGraphicsCaptureItemInterop =
+        //     windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>().unwrap();
+        // let capture_item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(hwnd).unwrap() };
+
+        let picker = GraphicsCapturePicker::new().unwrap();
+        let capture_item = picker.PickSingleItemAsync().unwrap().await.unwrap();
 
         let size = capture_item.Size().expect("failed to get display size");
         self.resolution = Some(Resolution {

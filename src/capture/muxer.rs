@@ -66,10 +66,10 @@ const SAMPLE_RATE: i32 = 48000;
 const FRAME_RATE: i32 = 30;
 
 impl CaptureMuxer {
-    pub fn new(_settings: CaptureSettings) -> Self {
+    pub async fn new(_settings: CaptureSettings) -> Self {
         let instant = Arc::new(Instant::now());
 
-        let video_api = VideoCaptureApi::new(instant.clone());
+        let video_api = VideoCaptureApi::new(instant.clone()).await;
         let audio_api = AudioCaptureApi::new(instant.clone());
 
         Self {
@@ -93,180 +93,184 @@ impl CaptureMuxer {
         }
     }
 
-    // pub fn write_clip(&mut self) {
-    //     let file_name = CString::new("clip.mp4").expect("cstring fail");
-    //     let mut format_context: *mut AVFormatContext = std::ptr::null_mut();
+    /*pub fn write_clip(&mut self) {
+        let file_name = CString::new("clip.mp4").expect("cstring fail");
+        let mut format_context: *mut AVFormatContext = std::ptr::null_mut();
 
-    //     // share avformatcontext for video and audio
-    //     if unsafe {
-    //         ffmpeg::avformat_alloc_output_context2(
-    //             &mut format_context,
-    //             std::ptr::null(),
-    //             std::ptr::null(),
-    //             file_name.as_ptr(),
-    //         )
-    //     } < 0
-    //     {
-    //         panic!("format ctx fail");
-    //     }
+        // share avformatcontext for video and audio
+        if unsafe {
+            ffmpeg::avformat_alloc_output_context2(
+                &mut format_context,
+                std::ptr::null(),
+                std::ptr::null(),
+                file_name.as_ptr(),
+            )
+        } < 0
+        {
+            panic!("format ctx fail");
+        }
 
-    //     let movflag = CString::new("movflags").unwrap();
-    //     let fastflag = CString::new("faststart").unwrap();
+        let movflag = CString::new("movflags").unwrap();
+        let fastflag = CString::new("faststart").unwrap();
 
-    //     if unsafe {
-    //         ffmpeg::av_opt_set(
-    //             (*format_context).priv_data,
-    //             movflag.as_ptr(),
-    //             fastflag.as_ptr(),
-    //             0,
-    //         )
-    //     } < 0
-    //     {
-    //         eprintln!("[encoder] warning: could not set movflags");
-    //     }
+        if unsafe {
+            ffmpeg::av_opt_set(
+                (*format_context).priv_data,
+                movflag.as_ptr(),
+                fastflag.as_ptr(),
+                0,
+            )
+        } < 0
+        {
+            eprintln!("[encoder] warning: could not set movflags");
+        }
 
-    //     // open aviocontext within avformatcontext for writing
-    //     if unsafe {
-    //         ffmpeg::avio_open(
-    //             &mut (*format_context).pb,
-    //             file_name.as_ptr(),
-    //             2, // cooked
-    //         )
-    //     } < 0
-    //     {
-    //         unsafe { ffmpeg::avformat_free_context(format_context) };
-    //         panic!("failed to open avio for writing");
-    //     }
+        // open aviocontext within avformatcontext for writing
+        if unsafe {
+            ffmpeg::avio_open(
+                &mut (*format_context).pb,
+                file_name.as_ptr(),
+                2, // cooked
+            )
+        } < 0
+        {
+            unsafe { ffmpeg::avformat_free_context(format_context) };
+            panic!("failed to open avio for writing");
+        }
 
-    //     let packets = self.replay_buffer.get_frames();
+        let packets = self.replay_buffer.get_frames();
 
-    //     for (i, &pkt) in packets.iter().enumerate() {
-    //         unsafe {
-    //             println!(
-    //                 "[debug] pkt {} size={} flags=0x{:X} pts={} dts={}",
-    //                 i,
-    //                 (*pkt).size,
-    //                 (*pkt).flags,
-    //                 (*pkt).pts,
-    //                 (*pkt).dts
-    //             );
-    //         }
-    //     }
+        for (i, &pkt) in packets.iter().enumerate() {
+            unsafe {
+                println!(
+                    "[debug] pkt {} size={} flags=0x{:X} pts={} dts={}",
+                    i,
+                    (*pkt).size,
+                    (*pkt).flags,
+                    (*pkt).pts,
+                    (*pkt).dts
+                );
+            }
+        }
 
-    //     println!(
-    //         "[encoder] writing {} frames from replay buffer",
-    //         packets.len()
-    //     );
+        println!(
+            "[encoder] writing {} frames from replay buffer",
+            packets.len()
+        );
 
-    //     self.create_stream(format_context, unsafe {
-    //         self.video_encoder.as_ref().unwrap().encoder.as_ref()
-    //     });
-    //     self.create_stream(format_context, unsafe {
-    //         self.audio_encoder.as_ref().unwrap().encoder.as_ref()
-    //     });
+        self.create_stream(format_context, unsafe {
+            self.video_encoder.as_ref().unwrap().encoder.as_ref()
+        });
+        self.create_stream(format_context, unsafe {
+            self.audio_encoder.as_ref().unwrap().encoder.as_ref()
+        });
 
-    //     // write file header
-    //     if unsafe { ffmpeg::avformat_write_header(format_context, std::ptr::null_mut()) } < 0 {
-    //         unsafe {
-    //             ffmpeg::avio_close((*format_context).pb);
-    //             ffmpeg::avformat_free_context(format_context);
-    //         }
-    //         panic!("failed to write header");
-    //     }
+        // write file header
+        if unsafe { ffmpeg::avformat_write_header(format_context, std::ptr::null_mut()) } < 0 {
+            unsafe {
+                ffmpeg::avio_close((*format_context).pb);
+                ffmpeg::avformat_free_context(format_context);
+            }
+            panic!("failed to write header");
+        }
 
-    //     // loop over packet pointers and write them to context
-    //     for &og_packet in packets.iter() {
-    //         unsafe {
-    //             // reference the packet so it doesnt get freed yet
-    //             let mut write_packet = ffmpeg::av_packet_alloc();
-    //             if write_packet.is_null() {
-    //                 eprintln!("failed to allocate write packet");
-    //                 continue;
-    //             }
+        // loop over packet pointers and write them to context
+        for &og_packet in packets.iter() {
+            unsafe {
+                // reference the packet so it doesnt get freed yet
+                let mut write_packet = ffmpeg::av_packet_alloc();
+                if write_packet.is_null() {
+                    eprintln!("failed to allocate write packet");
+                    continue;
+                }
 
-    //             if ffmpeg::av_packet_ref(write_packet, og_packet) < 0 {
-    //                 eprintln!("failed to ref packet");
-    //                 ffmpeg::av_packet_free(&mut write_packet);
-    //                 continue;
-    //             }
+                if ffmpeg::av_packet_ref(write_packet, og_packet) < 0 {
+                    eprintln!("failed to ref packet");
+                    ffmpeg::av_packet_free(&mut write_packet);
+                    continue;
+                }
 
-    //             if ffmpeg::av_interleaved_write_frame(format_context, write_packet) != 0 {
-    //                 eprintln!("error writing frame from replay buffer");
-    //             }
+                if ffmpeg::av_interleaved_write_frame(format_context, write_packet) != 0 {
+                    eprintln!("error writing frame from replay buffer");
+                }
 
-    //             // free it
-    //             ffmpeg::av_packet_free(&mut write_packet);
-    //         }
-    //     }
+                // free it
+                ffmpeg::av_packet_free(&mut write_packet);
+            }
+        }
 
-    //     println!("[encoder] flushing packet streams");
-    //     self.video_encoder
-    //         .as_mut()
-    //         .unwrap()
-    //         .flush_stream(format_context);
-    //     self.audio_encoder
-    //         .as_mut()
-    //         .unwrap()
-    //         .flush_stream(format_context);
+        println!("[encoder] flushing packet streams");
+        self.video_encoder
+            .as_mut()
+            .unwrap()
+            .flush_stream(format_context);
+        self.audio_encoder
+            .as_mut()
+            .unwrap()
+            .flush_stream(format_context);
 
-    //     println!("[encoder] attempting to write clip");
-    //     unsafe {
-    //         if format_context.is_null() {
-    //             panic!("output context is null");
-    //         }
+        println!("[encoder] attempting to write clip");
+        unsafe {
+            if format_context.is_null() {
+                panic!("output context is null");
+            }
 
-    //         // try to write video with internal io
-    //         if ffmpeg::av_write_trailer(format_context) != 0 {
-    //             panic!("clip failed to write");
-    //         };
+            // try to write video with internal io
+            if ffmpeg::av_write_trailer(format_context) != 0 {
+                panic!("clip failed to write");
+            };
 
-    //         // clean up resources for clip
-    //         ffmpeg::avio_close((*format_context).pb);
-    //         ffmpeg::avformat_free_context(format_context);
-    //     }
-    //     println!("[encoder] success!");
-    // }
+            // clean up resources for clip
+            ffmpeg::avio_close((*format_context).pb);
+            ffmpeg::avformat_free_context(format_context);
+        }
+        println!("[encoder] success!");
+    }*/
 
     pub fn init(&mut self) {
         ffmpeg::init().unwrap();
 
-        let video_codec = ffmpeg::encoder::find_by_name("h264_nvenc").unwrap();
+        // fomd codecs
+        let video_codec = ffmpeg::encoder::find_by_name("libx264").unwrap();
         let audio_codec = ffmpeg::encoder::find_by_name("aac").unwrap();
 
+        // create video encoder
         let mut video_enc = ffmpeg::encoder::new()
             .video()
-            .unwrap()
-            .open_as(video_codec)
-            .unwrap();
-        let mut audio_enc = ffmpeg::encoder::new()
-            .audio()
-            .unwrap()
-            .open_as(audio_codec)
-            .unwrap();
+            .expect("failed to create video encoder");
 
         let video_timebase = Rational::new(1, FRAME_RATE);
-        let audio_timebase = Rational::new(1, SAMPLE_RATE);
-
-        let channel_layout = ChannelLayout::default(2);
-        let api_sample_rate = self.audio_api.sample_rate.unwrap();
-
-        // video basic
         video_enc.set_width(self.video_api.resolution.as_ref().unwrap().width as u32);
         video_enc.set_height(self.video_api.resolution.as_ref().unwrap().height as u32);
         video_enc.set_format(Pixel::YUV420P);
         video_enc.set_time_base(video_timebase);
-
-        // video advanced
         video_enc.set_gop(1); // No B-frames
         video_enc.set_max_b_frames(0);
         video_enc.set_bit_rate(10_000_000); // 10 Mbps
         video_enc.set_max_bit_rate(10_000_000);
 
-        // audio basic
+        let video_enc = video_enc
+            .open_as(video_codec)
+            .expect("failed to open video encoder");
+
+        // create audio encoder
+        let mut audio_enc = ffmpeg::encoder::new()
+            .audio()
+            .expect("failed to create audio encoder");
+
+        let audio_timebase = Rational::new(1, SAMPLE_RATE);
+        let channel_layout = ChannelLayout::default(2);
+        let api_sample_rate = self.audio_api.sample_rate.unwrap();
+
         audio_enc.set_channel_layout(channel_layout);
         audio_enc.set_format(SAMPLE_FORMAT_OUT);
         audio_enc.set_time_base(audio_timebase);
 
+        let audio_enc = audio_enc
+            .open_as(audio_codec)
+            .expect("failed to open audio encoder");
+
+        // create video and audio converters
         let sws_input = (1920, 1080);
         let sws_output = (1280, 720);
 
@@ -313,8 +317,9 @@ impl CaptureMuxer {
         self.sws
             .as_mut()
             .unwrap()
-            .run(&input_frame, &mut output_frame);
-        self.encode_frame(output_frame);
+            .run(&input_frame, &mut output_frame)
+            .unwrap();
+        self.encode_video(output_frame);
     }
 
     fn encode_audio_frame(&mut self, audio_buffer: AudioBuffer) {
@@ -391,27 +396,22 @@ impl CaptureMuxer {
         }
     }
 
-    fn encode_frame(&mut self, frame: frame::Video) {
-        let encoder = match &mut self.audio_encoder {
-            Some(enc) => enc.as_mut(),
-            None => return, // or handle the error
+    fn encode_video(&mut self, frame: frame::Video) {
+        let video_encoder = match &mut self.video_encoder {
+            Some(enc) => enc,
+            None => return,
         };
 
-        let audio_encoder = match encoder.encoder().audio() {
-            Ok(enc) => enc,
-            Err(_) => return, // or handle the error
-        };
-
-        audio_encoder.send_frame(&frame);
+        video_encoder.send_frame(&frame).unwrap();
 
         // receive packets from encoder
         loop {
             let mut packet = packet::Packet::empty();
-            if audio_encoder.receive_packet(&mut packet).is_err() {
+            if video_encoder.receive_packet(&mut packet).is_err() {
                 break;
             }
 
-            packet.set_stream(1);
+            packet.set_stream(0);
 
             // add packet to replay buffer (buffer takes ownership)
             self.replay_buffer.add_frame(packet);
@@ -421,17 +421,12 @@ impl CaptureMuxer {
     }
 
     fn encode_audio(&mut self, frame: frame::Audio) {
-        let encoder = match &mut self.audio_encoder {
-            Some(enc) => enc.as_mut(),
+        let audio_encoder = match &mut self.audio_encoder {
+            Some(enc) => enc,
             None => return,
         };
 
-        let audio_encoder = match encoder.encoder().audio() {
-            Ok(enc) => enc,
-            Err(_) => return,
-        };
-
-        audio_encoder.send_frame(&frame);
+        audio_encoder.send_frame(&frame).unwrap();
 
         // receive packets from encoder
         loop {
