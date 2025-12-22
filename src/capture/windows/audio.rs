@@ -161,7 +161,7 @@ impl AudioCaptureApi {
         let sample_rate = wave_format.nSamplesPerSec;
         let channels = wave_format.nChannels;
         println!(
-            "[Audio] Channels: {}, Sample Rate: {}",
+            "[audio] channels: {}, sample rate: {}hz",
             channels, sample_rate
         );
 

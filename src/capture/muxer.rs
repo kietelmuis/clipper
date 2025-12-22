@@ -2,7 +2,9 @@ use crossbeam::channel::Receiver;
 
 use ffmpeg::util::rational::Rational;
 use ffmpeg_next::{
-    self as ffmpeg, ChannelLayout, encoder,
+    self as ffmpeg, ChannelLayout, Codec,
+    codec::Id,
+    encoder,
     format::{Sample, sample::Type},
     frame,
     packet::packet,
@@ -231,8 +233,8 @@ impl CaptureMuxer {
         ffmpeg::init().unwrap();
 
         // fomd codecs
-        let video_codec = ffmpeg::encoder::find_by_name("libx264").unwrap();
-        let audio_codec = ffmpeg::encoder::find_by_name("aac").unwrap();
+        let video_codec = ffmpeg::encoder::find(Id::HEVC).expect("could not find video codec");
+        let audio_codec = ffmpeg::encoder::find(Id::AAC).expect("could not find audio codec");
 
         // create video encoder
         let mut video_enc = ffmpeg::encoder::new()
@@ -373,11 +375,11 @@ impl CaptureMuxer {
         let mut last_print = Instant::now();
 
         loop {
-            // if let Ok(cmd) = rx.try_recv() {
-            //     match cmd {
-            //         MuxerCommand::Clip => self.write_clip(),
-            //     }
-            // }
+            if let Ok(cmd) = rx.try_recv() {
+                match cmd {
+                    MuxerCommand::Clip => todo!("rewrite write_clip for safe ffmpeg"),
+                }
+            }
 
             while let Ok(video_buf) = self.video_api.video_rx.try_recv() {
                 self.encode_video_frame(video_buf);
