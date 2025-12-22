@@ -64,7 +64,6 @@ pub struct CaptureMuxer {
 const SAMPLE_FORMAT_IN: Sample = Sample::F32(Type::Packed);
 const SAMPLE_FORMAT_OUT: Sample = Sample::F32(Type::Planar);
 
-const SAMPLE_RATE: i32 = 48000;
 const FRAME_RATE: i32 = 30;
 
 impl CaptureMuxer {
@@ -232,7 +231,7 @@ impl CaptureMuxer {
     pub fn init(&mut self) {
         ffmpeg::init().unwrap();
 
-        // fomd codecs
+        // find codecs
         let video_codec = ffmpeg::encoder::find(Id::HEVC).expect("could not find video codec");
         let audio_codec = ffmpeg::encoder::find(Id::AAC).expect("could not find audio codec");
 
@@ -241,14 +240,20 @@ impl CaptureMuxer {
             .video()
             .expect("failed to create video encoder");
 
+        let resolution = self
+            .video_api
+            .resolution
+            .as_ref()
+            .expect("could not find resolution");
+
         let video_timebase = Rational::new(1, FRAME_RATE);
-        video_enc.set_width(self.video_api.resolution.as_ref().unwrap().width as u32);
-        video_enc.set_height(self.video_api.resolution.as_ref().unwrap().height as u32);
+        video_enc.set_width(resolution.width as u32);
+        video_enc.set_height(resolution.height as u32);
         video_enc.set_format(Pixel::YUV420P);
         video_enc.set_time_base(video_timebase);
-        video_enc.set_gop(1); // No B-frames
+        video_enc.set_gop(1); // no b-frames
         video_enc.set_max_b_frames(0);
-        video_enc.set_bit_rate(10_000_000); // 10 Mbps
+        video_enc.set_bit_rate(10_000_000); // 10 mbps
         video_enc.set_max_bit_rate(10_000_000);
 
         let video_enc = video_enc
@@ -260,13 +265,29 @@ impl CaptureMuxer {
             .audio()
             .expect("failed to create audio encoder");
 
-        let audio_timebase = Rational::new(1, SAMPLE_RATE);
-        let channel_layout = ChannelLayout::default(2);
-        let api_sample_rate = self.audio_api.sample_rate.unwrap();
+        let api_sample_rate = self
+            .audio_api
+            .sample_rate
+            .expect("failed to get audio sample rate");
+
+        let api_bit_rate = self
+            .audio_api
+            .bit_rate
+            .expect("failed to get audio bit rate");
+
+        let api_channels = self
+            .audio_api
+            .channels
+            .expect("failed to get audio channels");
+
+        let channel_layout = ChannelLayout::default(api_channels);
 
         audio_enc.set_channel_layout(channel_layout);
         audio_enc.set_format(SAMPLE_FORMAT_OUT);
-        audio_enc.set_time_base(audio_timebase);
+        audio_enc.set_time_base(Rational::new(1, api_sample_rate));
+        audio_enc.set_rate(api_sample_rate);
+        audio_enc.set_bit_rate(api_bit_rate);
+        audio_enc.set_max_bit_rate(49_152_000); // 49 mbps btw
 
         let audio_enc = audio_enc
             .open_as(audio_codec)
@@ -277,7 +298,7 @@ impl CaptureMuxer {
         let sws_output = (1280, 720);
 
         let swr_input = (SAMPLE_FORMAT_IN, channel_layout, api_sample_rate as u32);
-        let swr_output = (SAMPLE_FORMAT_OUT, channel_layout, SAMPLE_RATE as u32);
+        let swr_output = (SAMPLE_FORMAT_OUT, channel_layout, api_sample_rate as u32);
 
         self.swr = Some(ffmpeg::software::resampler(swr_input, swr_output).unwrap());
         self.sws = Some(
