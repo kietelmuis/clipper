@@ -1,9 +1,5 @@
 use notify_rust::Notification;
 use rdev::{Event, EventType, listen};
-use windows::{
-    Graphics::Capture::GraphicsCapturePicker,
-    Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx},
-};
 
 use crate::capture::muxer::{CaptureMuxer, CaptureSettings, MuxerCommand};
 
