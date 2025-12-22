@@ -5,7 +5,7 @@ use windows::{
     Foundation::TypedEventHandler,
     Graphics::{
         Capture::{
-            Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCapturePicker,
+            Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem,
             GraphicsCaptureSession,
         },
         DirectX::{
@@ -14,7 +14,7 @@ use windows::{
         },
     },
     Win32::{
-        Foundation::HMODULE,
+        Foundation::{HMODULE, LPARAM, RECT, TRUE},
         Graphics::{
             Direct3D::D3D_DRIVER_TYPE_HARDWARE,
             Direct3D11::{
@@ -24,12 +24,17 @@ use windows::{
                 ID3D11Texture2D,
             },
             Dxgi::IDXGIDevice,
+            Gdi::{EnumDisplayMonitors, HDC, HMONITOR},
         },
-        System::WinRT::Direct3D11::{
-            CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
+        System::{
+            Console::GetConsoleWindow,
+            WinRT::{
+                Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess},
+                Graphics::Capture::IGraphicsCaptureItemInterop,
+            },
         },
     },
-    core::{IInspectable, Interface, Ref},
+    core::{BOOL, IInspectable, Interface, Ref},
 };
 
 use crate::capture::video::Resolution;
@@ -125,18 +130,40 @@ impl VideoCaptureApi {
                 .cast()
                 .expect("failed to cast d3d device");
 
-        // let hwnd = unsafe { GetConsoleWindow() };
-        // if hwnd.0 as u64 == 0 {
-        //     panic!("failed to get console window handle");
-        // }
+        let hwnd = unsafe { GetConsoleWindow() };
+        if hwnd.is_invalid() {
+            panic!("failed to get console window handle");
+        }
 
-        // // create capture item from console window
-        // let interop: IGraphicsCaptureItemInterop =
-        //     windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>().unwrap();
-        // let capture_item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(hwnd).unwrap() };
+        // make empty monitor
+        let mut monitor: HMONITOR = HMONITOR::default();
 
-        let picker = GraphicsCapturePicker::new().unwrap();
-        let capture_item = picker.PickSingleItemAsync().unwrap().await.unwrap();
+        unsafe extern "system" fn enum_proc(
+            hmonitor: HMONITOR,
+            _hdc: HDC,
+            _rect: *mut RECT,
+            data: LPARAM,
+        ) -> BOOL {
+            let target = data.0 as *mut HMONITOR;
+            unsafe { *target = hmonitor };
+            TRUE
+        }
+
+        // enumerate though monitors
+        unsafe {
+            let _ = EnumDisplayMonitors(
+                None,
+                None,
+                Some(enum_proc),
+                LPARAM(&mut monitor as *mut _ as isize),
+            );
+        };
+
+        // create capture item from console window
+        let interop: IGraphicsCaptureItemInterop =
+            windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>().unwrap();
+        let capture_item: GraphicsCaptureItem =
+            unsafe { interop.CreateForMonitor(monitor).unwrap() };
 
         let size = capture_item.Size().expect("failed to get display size");
         self.resolution = Some(Resolution {
@@ -154,7 +181,7 @@ impl VideoCaptureApi {
                 &directx_device,
                 DirectXPixelFormat::B8G8R8A8UIntNormalized,
                 3,
-                capture_item.Size().expect("failed to get monitor size"),
+                size,
             )
             .expect("failed to create frame pool"),
         );

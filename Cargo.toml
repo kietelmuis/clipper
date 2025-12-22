@@ -41,4 +41,9 @@ windows = { version = "0.62.2", features = [
 	"Win32_System_WinRT_Direct3D11",
 	"Win32_Graphics_Dxgi",
 	"Win32_Graphics_Dxgi_Common",
+
+	# monitor
+	"Win32_System_Console",
+	"Win32_System_WinRT_Graphics_Capture",
+	"Win32_Graphics_Gdi"
 ] }
