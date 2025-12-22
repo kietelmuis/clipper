@@ -22,7 +22,7 @@ use std::{
 
 use crate::capture::{
     audio::{AudioBuffer, AudioCaptureApi},
-    video::{VideoBuffer, VideoCaptureApi},
+    video::{Resolution, VideoBuffer, VideoCaptureApi},
 };
 
 use super::replay::ReplayBuffer;
@@ -52,6 +52,7 @@ pub struct CaptureMuxer {
     sws: Option<scaling::Context>,
     swr: Option<resampling::Context>,
 
+    target_resolution: [u32; 2],
     channel_layout: Option<ChannelLayout>,
     audio_channels: Option<usize>,
 
@@ -78,6 +79,7 @@ impl CaptureMuxer {
             audio_api,
             instant,
 
+            target_resolution: _settings.resolution,
             replay_buffer: ReplayBuffer::new(Duration::from_secs(3)),
 
             swr: None,
@@ -287,23 +289,35 @@ impl CaptureMuxer {
         audio_enc.set_time_base(Rational::new(1, api_sample_rate));
         audio_enc.set_rate(api_sample_rate);
         audio_enc.set_bit_rate(api_bit_rate);
-        audio_enc.set_max_bit_rate(49_152_000); // 49 mbps btw
 
         let audio_enc = audio_enc
             .open_as(audio_codec)
             .expect("failed to open audio encoder");
 
+        let api_resolution = self
+            .video_api
+            .resolution
+            .expect("failed to get audio bit rate");
+
         // create video and audio converters
-        let sws_input = (1920, 1080);
-        let sws_output = (1280, 720);
+        let sws_input = (api_resolution.width as u32, api_resolution.height as u32);
+        let sws_output = (self.target_resolution[0], self.target_resolution[1]);
 
         let swr_input = (SAMPLE_FORMAT_IN, channel_layout, api_sample_rate as u32);
         let swr_output = (SAMPLE_FORMAT_OUT, channel_layout, api_sample_rate as u32);
 
         self.swr = Some(ffmpeg::software::resampler(swr_input, swr_output).unwrap());
         self.sws = Some(
-            ffmpeg::software::scaler(Pixel::YUV420P, Flags::empty(), sws_input, sws_output)
-                .unwrap(),
+            ffmpeg::software::scaling::Context::get(
+                Pixel::BGRA,
+                sws_input.0,
+                sws_input.1,
+                Pixel::YUV420P,
+                sws_output.0,
+                sws_output.1,
+                Flags::empty(),
+            )
+            .expect("failed to get video scaler"),
         );
 
         self.audio_encoder = Some(audio_enc);
@@ -311,37 +325,30 @@ impl CaptureMuxer {
     }
 
     fn encode_video_frame(&mut self, video_buffer: VideoBuffer) {
-        let width = self.video_api.resolution.as_ref().unwrap().width as u32;
-        let height = self.video_api.resolution.as_ref().unwrap().height as u32;
+        let buffer_width = video_buffer.resolution.width as u32;
+        let buffer_height = video_buffer.resolution.height as u32;
 
-        let mut input_frame = frame::Video::new(Pixel::YUV420P, width, height);
-        input_frame.set_pts(Some(self.video_pts));
-        unsafe {
-            input_frame.alloc(Pixel::YUV420P, width, height);
-        }
+        // create bgra frame
+        let mut source_frame = frame::Video::new(Pixel::BGRA, buffer_width, buffer_height);
+        source_frame.set_pts(Some(self.video_pts));
 
-        // math (impossible)
-        let y_size = (width * height) as usize;
-        let uv_size = y_size / 4;
+        // copy data to frame
+        source_frame.data_mut(0).copy_from_slice(&video_buffer.bgra);
 
-        let buf = &video_buffer.bgra;
-
-        // copy yuv
-        input_frame.data_mut(0)[..y_size].copy_from_slice(&buf[..y_size]);
-        input_frame.data_mut(1)[..uv_size].copy_from_slice(&buf[y_size..y_size + uv_size]);
-        input_frame.data_mut(2)[..uv_size].copy_from_slice(&buf[y_size + uv_size..]);
-
-        let mut output_frame = frame::Video::new(Pixel::YUV420P, width, height);
+        // create yuv frame
+        let mut output_frame = frame::Video::new(
+            Pixel::YUV420P,
+            self.target_resolution[0],
+            self.target_resolution[1],
+        );
         output_frame.set_pts(Some(self.video_pts));
-        unsafe {
-            output_frame.alloc(Pixel::YUV420P, width, height);
-        }
 
+        // transcode bgra to yuv
         self.sws
             .as_mut()
-            .unwrap()
-            .run(&input_frame, &mut output_frame)
-            .unwrap();
+            .expect("failed to get video scaler")
+            .run(&source_frame, &mut output_frame)
+            .expect("failed to transcode video frame");
         self.encode_video(output_frame);
     }
 
