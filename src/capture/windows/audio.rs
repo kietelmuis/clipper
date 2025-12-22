@@ -43,8 +43,9 @@ unsafe impl Sync for InternalCaptureApi {}
 
 pub struct AudioCaptureApi {
     pub audio_rx: Receiver<AudioBuffer>,
-    pub sample_rate: Option<u16>,
-    pub channels: Option<u32>,
+    pub sample_rate: Option<i32>,
+    pub channels: Option<i32>,
+    pub bit_rate: Option<usize>,
 
     inner: Arc<Mutex<InternalCaptureApi>>,
     stop_tx: channel::Sender<bool>,
@@ -92,6 +93,7 @@ impl AudioCaptureApi {
             audio_rx,
             sample_rate: None,
             channels: None,
+            bit_rate: None,
             inner: internal_api.clone(),
             stop_tx,
         };
@@ -154,47 +156,46 @@ impl AudioCaptureApi {
             .expect("couldn't activate audio device");
 
         // Get format directly from audio client
-        let format_ptr = unsafe { audio_client.GetMixFormat().unwrap() };
-        let wave_format = unsafe { format_ptr.as_ref().expect("Null format pointer") };
+        let format_ptr = unsafe {
+            audio_client
+                .GetMixFormat()
+                .expect("could not get wave format")
+        };
+        let wave_format = unsafe { format_ptr.as_ref().expect("could not get wave format") };
 
         // Check format details
         let sample_rate = wave_format.nSamplesPerSec;
         let channels = wave_format.nChannels;
+        let bits_rate = wave_format.nSamplesPerSec
+            * wave_format.wBitsPerSample as u32
+            * wave_format.nChannels as u32;
         println!(
-            "[audio] channels: {}, sample rate: {}hz",
-            channels, sample_rate
+            "[audio] channels: {}, sample rate: {}hz, bits rate: {}bps",
+            channels, sample_rate, bits_rate
         );
+
+        self.sample_rate = Some(sample_rate as i32);
+        self.channels = Some(channels as i32);
+        self.bit_rate = Some(bits_rate as usize);
 
         self.inner.lock().unwrap().channels = Some(channels);
 
-        // Validate format type
-        let is_float = match wave_format.wFormatTag {
+        match wave_format.wFormatTag {
             WAVE_FLOAT => true,
-            WAVE_EXTENSIBLE => {
-                // Cast to WAVEFORMATEXTENSIBLE and read unaligned
-                let wave_format_ext_ptr =
-                    unsafe { format_ptr.cast::<WAVEFORMATEXTENSIBLE>().as_ref() }.unwrap();
+            WAVE_EXTENSIBLE => unsafe {
+                // get format guid
+                let sub_format_ptr =
+                    std::ptr::addr_of!((*format_ptr.cast::<WAVEFORMATEXTENSIBLE>()).SubFormat);
 
-                // SAFETY: We know the pointer is valid and we're using read_unaligned
-                let sub_format = unsafe {
-                    // Get pointer to SubFormat field without creating a reference
-                    let sub_format_ptr = std::ptr::addr_of!((*wave_format_ext_ptr).SubFormat);
-                    std::ptr::read_unaligned(sub_format_ptr)
-                };
-
-                sub_format == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
-            }
-            _ => false,
+                std::ptr::read_unaligned(sub_format_ptr) == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+            },
+            _ => panic!("unsupported audio format"),
         };
-
-        if !is_float {
-            panic!("Unsupported audio format - expected IEEE Float");
-        }
 
         unsafe {
             audio_client.Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_LOOPBACK, // wait for event and
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_LOOPBACK, // wait for event instead of polling
                 1000000,                                                          // 100ms buffer
                 0,
                 format_ptr,
